@@ -1,0 +1,15 @@
+{
+  "active_server": "sample_reference_server",
+  "servers": {
+    "sample_reference_server": {
+      "command": "python",
+      "args": ["mock_servers/sample_server.py"],
+      "env": {}
+    },
+    "filesystem_reference": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+      "env": {}
+    }
+  }
+}
