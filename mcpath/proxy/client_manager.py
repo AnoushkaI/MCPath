@@ -5,6 +5,7 @@ Connects to target MCP servers using official MCP Python SDK client transports.
 
 from contextlib import asynccontextmanager
 import logging
+import os
 import sys
 from typing import Any, AsyncIterator, Dict, List, Optional
 from mcp.client.session import ClientSession
@@ -43,11 +44,18 @@ class DownstreamClientManager:
             else:
                 resolved_args.append(arg)
 
-        env = self.server_def.env if self.server_def.env else None
+        # Merge full OS environment with any server-specific overrides.
+        # This is required on Windows so that Node/uvx subprocesses inherit
+        # PATH, APPDATA, HOME, TEMP, etc. Passing only the small server env
+        # dict leaves the subprocess with no PATH and it cannot start.
+        merged_env = {**os.environ}
+        if self.server_def.env:
+            merged_env.update(self.server_def.env)
+
         server_params = StdioServerParameters(
             command=cmd,
             args=resolved_args,
-            env=env,
+            env=merged_env,
             cwd=str(PROJECT_ROOT)
         )
 

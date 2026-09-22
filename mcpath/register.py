@@ -13,8 +13,16 @@ import asyncio
 import logging
 import sys
 from typing import Dict, List, Optional
+
+if sys.stdout.encoding != "utf-8":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 from mcpath.backend.persistence.database import init_db, register_trusted_server_and_tools
-from mcpath.config.settings import settings
+from mcpath.config.settings import settings, interpolate_server_config
 from mcpath.core.logging import setup_logging
 from mcpath.pipeline.stages.stage1_hash import canonicalize_and_hash
 from mcpath.proxy.client_manager import DownstreamClientManager
@@ -32,6 +40,8 @@ async def register_server_by_name(server_name: str) -> List[Dict[str, str]]:
         )
 
     server_def = config.servers[server_name]
+    # Expand ${VAR} placeholders (FILESYSTEM_ALLOWED_PATHS, GIT_REPOSITORY_PATH, etc.)
+    server_def = interpolate_server_config(server_def, settings)
     logger.info("Connecting to downstream server '%s' for trusted registration...", server_name)
 
     client_manager = DownstreamClientManager(server_def, server_name=server_name)

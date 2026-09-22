@@ -41,7 +41,7 @@ async def verify():
                     print(f"         [OK] Connected to: {downstream_session.server_info.name}")
 
                     server_def = ServerDefinition(command="mock", args=[])
-                    client_manager = DownstreamClientManager(server_def, server_name="sample-server")
+                    client_manager = DownstreamClientManager(server_def, server_name="sample_reference_server")
                     proxy_server = create_proxy_server(
                         client_manager=client_manager,
                         downstream_session=downstream_session,

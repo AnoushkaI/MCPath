@@ -66,17 +66,28 @@
 - Complete PostgreSQL 8-table relational schema with SQLAlchemy models, foreign keys, unique constraints, and indexes (`servers`, `tools`, `approved_hashes`, `capabilities`, `baseline_traces`, `security_events`, `stage_results`, `decisions`).
 - FastAPI backend application ([`mcpath/backend/app.py`](file:///c:/projects/mcp%20proxy/mcpath/backend/app.py)) with endpoints for health, overview metrics, server inventory, tool lists, approved hash management, security events, and stage results.
 - Downstream server connection management via [`DownstreamClientManager`](file:///c:/projects/mcp%20proxy/mcpath/proxy/client_manager.py).
-- Reference Mock MCP Server ([`mock_servers/sample_server.py`](file:///c:/projects/mcp%20proxy/mock_servers/sample_server.py)) providing `echo`, `calculate`, `read_customer` (sensitive PII), `send_email` (exfiltration endpoint), `summarize_repository`, and `delete_repository`.
+- **Real MCP server support** — Filesystem (npx), Git (uvx), Microsoft PostgreSQL (npx) servers are all configured and verified:
+  - `filesystem`: `cmd /c npx -y @modelcontextprotocol/server-filesystem <path>` (14 tools, path from `FILESYSTEM_ALLOWED_PATHS`).
+  - `git`: `uvx mcp-server-git --repository <path>` (12 tools, path from `GIT_REPOSITORY_PATH`).
+  - `postgres-mcp`: `cmd /c npx -y @microsoft/postgres-mcp@latest run` (13 tools, connection URI from `POSTGRES_MCP_CONNECTION_STRING`, targeting isolated `mcpath_demo_db`).
+  - Switching servers requires only a `--server <name>` flag; no pipeline code changes.
+- **${VAR} env-var interpolation** in `server_config.json` args/env via `interpolate_server_config()` — machine-specific paths and credentials stay in `.env` only.
+- Reference Mock MCP Server ([`mock_servers/sample_server.py`](file:///c:/projects/mcp%20proxy/mock_servers/sample_server.py)) providing `echo`, `calculate`, `read_customer` (sensitive PII), `send_email` (exfiltration endpoint), `summarize_repository`, and `delete_repository`. Kept strictly for test/regression fixtures (`sample_reference_server`).
 
 ### Important Files & Modules
 - [`mcpath/pipeline/stages/stage1_hash.py`](file:///c:/projects/mcp%20proxy/mcpath/pipeline/stages/stage1_hash.py): Stage 1 Tool Integrity Hash Check implementation.
 - [`mcpath/backend/persistence/models.py`](file:///c:/projects/mcp%20proxy/mcpath/backend/persistence/models.py): SQLAlchemy models for all 8 database tables.
-- [`mcpath/backend/persistence/database.py`](file:///c:/projects/mcp%20proxy/mcpath/backend/persistence/database.py): Async database engine, session management, and repository functions.
+- [`mcpath/backend/persistence/database.py`](file:///c:/projects/mcp%20proxy/mcpath/backend/persistence/database.py): Async database engine, session management, repository functions, and credential-redacting server registration.
 - [`mcpath/backend/routes/`](file:///c:/projects/mcp%20proxy/mcpath/backend/routes/): FastAPI route modules for `overview`, `servers`, `events`, `hashes`, and `stage_results`.
 - [`mcpath/proxy/server.py`](file:///c:/projects/mcp%20proxy/mcpath/proxy/server.py): Intercepting MCP server handlers for `list_tools` and `call_tool`.
+- [`mcpath/proxy/client_manager.py`](file:///c:/projects/mcp%20proxy/mcpath/proxy/client_manager.py): Downstream MCP client manager (merges full OS env for Node/uvx subprocess compatibility).
+- [`mcpath/proxy/passthrough.py`](file:///c:/projects/mcp%20proxy/mcpath/proxy/passthrough.py): Passthrough coordinator — calls `interpolate_server_config()` before launching subprocess.
+- [`mcpath/config/settings.py`](file:///c:/projects/mcp%20proxy/mcpath/config/settings.py): Settings class with `FILESYSTEM_ALLOWED_PATHS`, `GIT_REPOSITORY_PATH`, `POSTGRES_MCP_CONNECTION_STRING`, and `interpolate_server_config()` utility.
+- [`config/server_config.json`](file:///c:/projects/mcp%20proxy/config/server_config.json): Declarative server registry (filesystem, git, postgres-mcp, sample_reference_server).
 - [`mcpath/pipeline/pipeline_runner.py`](file:///c:/projects/mcp%20proxy/mcpath/pipeline/pipeline_runner.py): Ordered stage execution coordinator with async DB logging.
-- [`verify_day2.py`](file:///c:/projects/mcp%20proxy/verify_day2.py): Standalone Day 2 milestone and rug-pull verification script.
-- [`verify_milestone.py`](file:///c:/projects/mcp%20proxy/verify_milestone.py): Day 1 baseline passthrough verification script.
+- [`verify_real_servers.py`](file:///c:/projects/mcp%20proxy/verify_real_servers.py): Real-server end-to-end verification (full production flow for filesystem, git, postgres-mcp).
+- [`verify_stage1_e2e.py`](file:///c:/projects/mcp%20proxy/verify_stage1_e2e.py): Stage 1 lifecycle verification against PostgreSQL.
+- [`verify_day2.py`](file:///c:/projects/mcp%20proxy/verify_day2.py): Day 2.1 milestone verification script.
 
 ### How to Run and Verify
 1. **Run full automated test suite (22 tests)**:
@@ -85,26 +96,35 @@
    ```
 2. **Run Trusted Registration (establish approved SHA-256 baselines in PostgreSQL)**:
    ```powershell
-   # Register all configured servers
+   # Register all configured servers (filesystem, git, postgres-mcp, sample)
    .venv\Scripts\python.exe -m mcpath.register --all
+
    # Register a specific server
-   .venv\Scripts\python.exe -m mcpath.register --server sample_reference_server
+   .venv\Scripts\python.exe -m mcpath.register --server filesystem
+   .venv\Scripts\python.exe -m mcpath.register --server git
+   .venv\Scripts\python.exe -m mcpath.register --server postgres-mcp
    ```
-3. **Run Stage 1 end-to-end live verification (against PostgreSQL)**:
+3. **Run real-server end-to-end verification (all 3 real servers + regression)**:
+   ```powershell
+   .venv\Scripts\python.exe verify_real_servers.py
+   # Or a single server:
+   .venv\Scripts\python.exe verify_real_servers.py --server postgres-mcp
+   ```
+4. **Run Stage 1 end-to-end live verification (against PostgreSQL)**:
    ```powershell
    .venv\Scripts\python.exe verify_stage1_e2e.py
    ```
-4. **Run Day 2.1 verification script (Rug Pull blocking & DB check)**:
+5. **Run the proxy for a specific server**:
    ```powershell
-   .venv\Scripts\python.exe verify_day2.py
+   .venv\Scripts\python.exe run_proxy.py --server filesystem --log-level INFO
+   .venv\Scripts\python.exe run_proxy.py --server git --log-level INFO
+   .venv\Scripts\python.exe run_proxy.py --server postgres-mcp --log-level INFO
+   .venv\Scripts\python.exe run_proxy.py --server sample_reference_server --log-level INFO
+   ```l INFO
    ```
-5. **Run FastAPI observability backend**:
+6. **Run FastAPI observability backend**:
    ```powershell
    .venv\Scripts\uvicorn.exe mcpath.backend.app:app --host 127.0.0.1 --port 8000 --reload
-   ```
-6. **Run standalone stdio proxy**:
-   ```powershell
-   .venv\Scripts\python.exe run_proxy.py --server sample_reference_server --log-level INFO
    ```
 
 ---
@@ -138,7 +158,7 @@ The 6-stage pipeline evaluates every intercepted call in fixed sequence:
 
 ## 6. Next Development & Roadmap
 
-- **Current Stage**: Day 2.1 Complete. Ready for Day 3 development (Stage 2 Capability Graph & Attack Path Analysis).
+- **Current Stage**: Real MCP server support complete. Ready for Day 3 development (Stage 2 Capability Graph).
 - **Immediate Next Tasks**:
   1. **Stage 2 Capability Graph Builder (Days 5-6)**:
      - Automatically parse tool parameters and descriptions to extract Resource, Action, and Destination nodes.
@@ -157,6 +177,39 @@ The 6-stage pipeline evaluates every intercepted call in fixed sequence:
 
 ## 7. Recent Changes
 
+- **2026-09-22 (Registry Cleanup & Microsoft PostgreSQL MCP Integration)**:
+  - **Registry Cleanup**:
+    - Kept `sample_reference_server` strictly as a test/regression fixture; removed obsolete `sample-server` from tests, scripts, and database.
+    - Removed obsolete duplicate filesystem server (`filesystem_reference`) from PostgreSQL; maintained single canonical `filesystem` entry.
+    - Investigated and resolved the persistence issue where `command`/`args` fields for filesystem, git, and fetch were empty: `verify_real_servers.py` had omitted command/args from `register_trusted_server_and_tools()`, causing `database.py` defaults to overwrite existing entries with `python`/`[]`. Fixed `database.py` to preserve existing command/args when updating, and updated registration callers to pass explicit command/args/env definitions.
+    - Implemented `_sanitize_env_vars()` in `database.py` to redact sensitive credentials (passwords, tokens, keys, connection URIs) from stored environment variables in PostgreSQL tables.
+  - **Microsoft PostgreSQL MCP Integration (`postgres-mcp`)**:
+    - Replaced `fetch` with official `@microsoft/postgres-mcp` as the third real demo server.
+    - Preserved MCPath server-agnostic architecture without any PostgreSQL-specific modifications to Stages 1–6.
+    - Created an isolated `mcpath_demo_db` database and `mcpath_demo_user` role, with strict isolation preventing any access to MCPath's core database. Seeded demo tables (`demo_customers`, `demo_orders`).
+    - Configured `postgres-mcp` via `config/server_config.json` and `.env` using `${POSTGRES_MCP_CONNECTION_STRING}` with zero hardcoded credentials in the repository.
+    - Untracked `.env` from Git and added comprehensive exclusion rules to `.gitignore`.
+    - Executed trusted registration discovering 13 tools and storing approved baseline hashes in PostgreSQL.
+    - Confirmed tools are visible and directly suitable for Stage 2 capabilities:
+      - **READ**: `postgres_mcp_query`
+      - **WRITE/MODIFY**: `postgres_mcp_modify`
+      - **Schema Access**: `postgres_mcp_db_context`
+      - **Data Loading**: `postgres_mcp_bulk_load_csv`
+    - Updated `verify_real_servers.py` to test `postgres-mcp` (`postgres_mcp_list_connection_profiles` tool call) alongside `filesystem`, `git`, and regression suite.
+    - **Verification Result**: 100% pass across all real servers, Stage 1 live lifecycle, and all 22 automated unit/integration tests.
+
+
+- **2026-09-22 (Real MCP Server Support)**:
+  - Added `filesystem`, `git`, and `fetch` server entries to [`config/server_config.json`](file:///c:/projects/mcp%20proxy/config/server_config.json) using correct production commands.
+    - Filesystem: `cmd /c npx -y @modelcontextprotocol/server-filesystem ${FILESYSTEM_ALLOWED_PATHS}` (14 tools)
+    - Git: `uvx mcp-server-git --repository ${GIT_REPOSITORY_PATH}` (12 tools, no GitHub PAT)
+    - Fetch: `uvx mcp-server-fetch` (1 tool, no credentials)
+  - Added `FILESYSTEM_ALLOWED_PATHS` and `GIT_REPOSITORY_PATH` fields to `Settings` in [`settings.py`](file:///c:/projects/mcp%20proxy/mcpath/config/settings.py).
+  - Added `interpolate_server_config()` utility to resolve `${VAR}` placeholders in server args/env at runtime from `.env` values.
+  - Fixed `DownstreamClientManager` to merge full `os.environ` into subprocess env (required for Node/uvx on Windows to inherit PATH).
+  - Updated `passthrough.py` and `register.py` to call `interpolate_server_config` before spawning the subprocess.
+  - Created [`verify_real_servers.py`](file:///c:/projects/mcp%20proxy/verify_real_servers.py): full production verification (connect → tools/list → trusted registration → Stage 1 → tools/call) for all 3 real servers + regression check.
+  - **Verification result**: All 3 real servers + 22 existing tests pass (100%).
 - **2026-09-22 (Day 2.1 Milestone Completed)**:
   - Created Trusted Registration CLI [`mcpath/register.py`](file:///c:/projects/mcp%20proxy/mcpath/register.py): `python -m mcpath.register --all` or `--server <name>`. Connects to each MCP server, calls `tools/list`, extracts `{name, description, inputSchema}`, canonicalizes, computes SHA-256, upserts idempotent approved baseline record in PostgreSQL.
   - Enforced strict registration/runtime separation: `tools/list` interception in proxy only caches definitions for runtime lookup — it does NOT auto-create approved hashes. Approved hashes are ONLY created by the explicit registration CLI.

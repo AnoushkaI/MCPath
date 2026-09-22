@@ -69,11 +69,54 @@ class Settings(BaseSettings):
     # Optional model keys for Stage 5 secondary classifier
     anthropic_api_key: str | None = Field(default=None, alias="ANTHROPIC_API_KEY")
 
+    # Real downstream MCP server configuration.
+    # Set these in .env — no defaults to avoid accidentally granting access to
+    # unintended paths. Leave blank to skip the corresponding server.
+    filesystem_allowed_paths: str = Field(default="", alias="FILESYSTEM_ALLOWED_PATHS")
+    git_repository_path: str = Field(default="", alias="GIT_REPOSITORY_PATH")
+    postgres_mcp_connection_string: str = Field(default="", alias="POSTGRES_MCP_CONNECTION_STRING")
+
     def get_server_config(self) -> ServerConfig:
         p = Path(self.server_config_path)
         if not p.is_absolute():
             p = (PROJECT_ROOT / p).resolve()
         return ServerConfig.load_from_file(p)
+
+
+def interpolate_server_config(server_def: "ServerDefinition", s: "Settings") -> "ServerDefinition":
+    """Expand ${VAR} placeholders in a ServerDefinition's args and env values.
+
+    Placeholder resolution:
+      1. Settings fields loaded from .env (FILESYSTEM_ALLOWED_PATHS, GIT_REPOSITORY_PATH, …).
+      2. Raw OS environment (os.environ) as a fallback for anything else.
+
+    Keeps machine-specific paths and credentials out of server_config.json while
+    allowing the config to remain fully declarative. Unresolved ${VAR} tokens are
+    left unchanged so errors surface clearly in logs rather than silently.
+    """
+    import re
+
+    # Build lookup: start with full OS environment so spawned subprocesses inherit PATH.
+    lookup: dict[str, str] = dict(os.environ)
+
+    # Overlay settings fields (already incorporate .env values) so they take precedence.
+    for field_name, field_info in Settings.model_fields.items():
+        alias = field_info.alias or field_name
+        value = getattr(s, field_name, None)
+        if value is not None:
+            lookup[str(alias)] = str(value)
+            lookup[field_name.upper()] = str(value)  # also accept UPPER_FIELD_NAME form
+
+    def _expand(text: str) -> str:
+        def _replace(m: re.Match) -> str:
+            return lookup.get(m.group(1), m.group(0))  # leave unresolved ${VAR} unchanged
+        return re.sub(r"\$\{([^}]+)\}", _replace, text)
+
+    return ServerDefinition(
+        command=server_def.command,
+        args=[_expand(a) for a in server_def.args],
+        env={k: _expand(v) for k, v in server_def.env.items()},
+    )
 
 
 settings = Settings()

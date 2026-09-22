@@ -3,6 +3,7 @@
 from datetime import datetime, timezone
 import json
 import logging
+import re
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple
 from sqlalchemy import select, update, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -171,11 +172,26 @@ async def register_server(
     return await _run_with_retry(_op, session=session)
 
 
+def _sanitize_env_vars(env_vars: Optional[Dict[str, str]]) -> Dict[str, str]:
+    """Redact sensitive credentials from stored environment variables."""
+    if not env_vars:
+        return {}
+    sanitized = {}
+    for k, v in env_vars.items():
+        if any(secret_kw in k.upper() for secret_kw in ("PASSWORD", "SECRET", "KEY", "TOKEN")):
+            sanitized[k] = "******"
+        elif "CONNECTION_STRING" in k.upper() or "DATABASE_URL" in k.upper():
+            sanitized[k] = re.sub(r"://([^:]+):([^@]+)@", r"://\1:******@", str(v))
+        else:
+            sanitized[k] = v
+    return sanitized
+
+
 async def register_trusted_server_and_tools(
     server_name: str,
     tools: List[Dict[str, Any]],
     canonicalize_and_hash_fn: Any,
-    command: str = "python",
+    command: Optional[str] = None,
     args: Optional[List[str]] = None,
     env_vars: Optional[Dict[str, str]] = None,
     approved_by: str = "admin:trusted_registration",
@@ -183,6 +199,8 @@ async def register_trusted_server_and_tools(
 ) -> List[Tuple[ToolDB, ApprovedHashDB]]:
     """Register server, tools, and compute/store approved SHA-256 baseline hashes (Idempotent)."""
     async def _op(s: AsyncSession):
+        safe_env = _sanitize_env_vars(env_vars) if env_vars is not None else None
+
         # 1. Upsert server record
         stmt_srv = select(ServerDB).where(ServerDB.name == server_name)
         res_srv = await s.execute(stmt_srv)
@@ -190,17 +208,20 @@ async def register_trusted_server_and_tools(
         if server is None:
             server = ServerDB(
                 name=server_name,
-                command=command,
-                args=args or [],
-                env_vars=env_vars or {},
+                command=command or "python",
+                args=args if args is not None else [],
+                env_vars=safe_env if safe_env is not None else {},
                 is_active=True
             )
             s.add(server)
             await s.flush()
         else:
-            server.command = command
-            server.args = args or []
-            server.env_vars = env_vars or {}
+            if command is not None:
+                server.command = command
+            if args is not None:
+                server.args = args
+            if safe_env is not None:
+                server.env_vars = safe_env
             server.is_active = True
             await s.flush()
 

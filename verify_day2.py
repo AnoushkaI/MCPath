@@ -55,22 +55,24 @@ async def verify_day2():
                     await downstream_session.initialize()
 
                     server_def = ServerDefinition(command="mock", args=[])
-                    client_manager = DownstreamClientManager(server_def, server_name="sample-server")
+                    client_manager = DownstreamClientManager(server_def, server_name="sample_reference_server")
                     
                     # 3. Trusted Registration
-                    print("\n[Step 3] Running Trusted Registration for 'sample-server'...")
+                    print("\n[Step 3] Running Trusted Registration for 'sample_reference_server'...")
                     raw_tools = await client_manager.list_tools(downstream_session)
                     tools_data = [t.model_dump(mode="json") for t in raw_tools.tools]
                     synced = await register_trusted_server_and_tools(
-                        server_name="sample-server",
+                        server_name="sample_reference_server",
                         tools=tools_data,
                         canonicalize_and_hash_fn=canonicalize_and_hash,
+                        command="python",
+                        args=["mock_servers/sample_server.py"],
                         approved_by="admin:trusted_registration"
                     )
                     print(f"         [OK] Registered {len(synced)} tools and baseline hashes in PostgreSQL.")
 
                     # Verify approved hash stored in DB
-                    calc_hash = await get_approved_hash("sample-server", "calculate")
+                    calc_hash = await get_approved_hash("sample_reference_server", "calculate")
                     print(f"         [OK] Approved SHA-256 for 'calculate': {calc_hash}")
                     assert calc_hash is not None
 

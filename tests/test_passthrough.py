@@ -48,13 +48,13 @@ async def test_end_to_end_proxy_passthrough():
                     await downstream_session.initialize()
 
                     server_def = ServerDefinition(command="mock", args=[])
-                    client_manager = DownstreamClientManager(server_def, server_name="sample-server")
+                    client_manager = DownstreamClientManager(server_def, server_name="sample_reference_server")
 
                     # Register trusted baseline in DB for Stage 1
                     raw_tools = await downstream_session.list_tools()
                     tools_data = [t.model_dump(mode="json") for t in raw_tools.tools]
                     await register_trusted_server_and_tools(
-                        server_name="sample-server",
+                        server_name="sample_reference_server",
                         tools=tools_data,
                         canonicalize_and_hash_fn=canonicalize_and_hash
                     )

@@ -108,7 +108,7 @@ async def test_1_trusted_registration_creates_baseline(e2e_db_session: AsyncSess
 @pytest.mark.asyncio
 async def test_2_unchanged_definition_passes_and_executes(e2e_db_session: AsyncSession):
     """Test 2: Call tool with unchanged definition -> Stage 1 = PASS -> Downstream tool executes."""
-    server_name = "sample-server"
+    server_name = "sample_reference_server"
 
     async def db_hash_provider(s_name, t_name):
         return await get_approved_hash(s_name, t_name, session=e2e_db_session)
@@ -167,7 +167,7 @@ async def test_2_unchanged_definition_passes_and_executes(e2e_db_session: AsyncS
 @pytest.mark.asyncio
 async def test_3_changed_description_rug_pull_blocks(e2e_db_session: AsyncSession):
     """Test 3: Change only tool description -> Stage 1 = BLOCK, downstream tool is NOT called."""
-    server_name = "sample-server"
+    server_name = "sample_reference_server"
 
     async def db_hash_provider(s_name, t_name):
         return await get_approved_hash(s_name, t_name, session=e2e_db_session)
@@ -227,7 +227,7 @@ async def test_3_changed_description_rug_pull_blocks(e2e_db_session: AsyncSessio
 @pytest.mark.asyncio
 async def test_4_changed_schema_blocks(e2e_db_session: AsyncSession):
     """Test 4: Change input schema -> Stage 1 = BLOCK, downstream NOT called."""
-    server_name = "sample-server"
+    server_name = "sample_reference_server"
 
     async def db_hash_provider(s_name, t_name):
         return await get_approved_hash(s_name, t_name, session=e2e_db_session)
@@ -331,7 +331,7 @@ async def test_5_reordered_json_keys_pass():
 @pytest.mark.asyncio
 async def test_6_missing_or_deleted_baseline_fails_closed(e2e_db_session: AsyncSession):
     """Test 6: Deleted/missing approved hash -> NO_APPROVED_BASELINE -> BLOCK, downstream NOT called."""
-    server_name = "sample-server"
+    server_name = "sample_reference_server"
     
     # Do NOT register any baseline in DB
     async def empty_hash_provider(s_name, t_name):
@@ -382,7 +382,7 @@ async def test_6_missing_or_deleted_baseline_fails_closed(e2e_db_session: AsyncS
 @pytest.mark.asyncio
 async def test_7_registration_is_idempotent(e2e_db_session: AsyncSession):
     """Test 7: Running registration multiple times creates NO duplicate server/tool/hash records."""
-    server_name = "sample-server"
+    server_name = "sample_reference_server"
     sample_tools = [
         {"name": "echo", "description": "Echo", "inputSchema": {"type": "object"}},
         {"name": "calculate", "description": "Calculate", "inputSchema": {"type": "object"}}

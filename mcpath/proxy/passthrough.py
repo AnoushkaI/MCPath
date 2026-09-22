@@ -5,7 +5,7 @@ Loads active server configuration and manages the proxy lifecycle.
 
 import logging
 from typing import Optional
-from mcpath.config.settings import settings, ServerDefinition
+from mcpath.config.settings import settings, ServerDefinition, interpolate_server_config
 from mcpath.core.exceptions import ConfigurationError
 from mcpath.pipeline.pipeline_runner import PipelineRunner
 from mcpath.proxy.client_manager import DownstreamClientManager
@@ -29,7 +29,10 @@ class PassthroughProxy:
         if server_def:
             self.server_def = server_def
         elif self.server_name in server_config.servers:
-            self.server_def = server_config.servers[self.server_name]
+            raw_def = server_config.servers[self.server_name]
+            # Expand ${VAR} placeholders so machine-specific paths and credentials
+            # from .env are resolved before the subprocess is launched.
+            self.server_def = interpolate_server_config(raw_def, settings)
         else:
             raise ConfigurationError(
                 f"Server '{self.server_name}' not found in configuration: {list(server_config.servers.keys())}"
