@@ -8,7 +8,7 @@ Tests:
 5. Benign metadata / key ordering -> Same canonical hash (PASS)
 6. Hash mismatch prevents downstream execution
 7. Hash match continues to next pipeline stage/interface without direct execution
-8. Fail-closed on missing approved hash or database error
+8. Fail-closed on missing approved hash (NO_APPROVED_BASELINE)
 """
 
 import copy
@@ -19,7 +19,7 @@ from mcpath.backend.persistence.models import Base, ServerDB, ToolDB, ApprovedHa
 from mcpath.backend.persistence.database import (
     init_db,
     register_server,
-    sync_discovered_tools,
+    register_trusted_server_and_tools,
     get_approved_hash,
     persist_security_event,
 )
@@ -68,7 +68,6 @@ def test_canonicalize_reordered_keys():
         }
     }
 
-    # Same semantic definition with shuffled dictionary key ordering at multiple levels
     def2 = {
         "description": "Perform arithmetic calculations",
         "inputSchema": {
@@ -140,7 +139,7 @@ async def test_identical_definition_pass(test_db_session: AsyncSession):
     }
 
     # Store initial approved tool
-    await sync_discovered_tools(
+    await register_trusted_server_and_tools(
         server_name=server_name,
         tools=[original_def],
         canonicalize_and_hash_fn=canonicalize_and_hash,
@@ -178,7 +177,7 @@ async def test_changed_description_block(test_db_session: AsyncSession):
         "description": "Read customer profile data",
         "inputSchema": {"type": "object", "properties": {"customer_id": {"type": "string"}}}
     }
-    await sync_discovered_tools(
+    await register_trusted_server_and_tools(
         server_name=server_name,
         tools=[original_def],
         canonicalize_and_hash_fn=canonicalize_and_hash,
@@ -220,7 +219,7 @@ async def test_changed_schema_block(test_db_session: AsyncSession):
         "description": "Perform calculations",
         "inputSchema": {"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}}}
     }
-    await sync_discovered_tools(
+    await register_trusted_server_and_tools(
         server_name=server_name,
         tools=[original_def],
         canonicalize_and_hash_fn=canonicalize_and_hash,
@@ -266,7 +265,7 @@ async def test_hash_mismatch_prevents_downstream_execution(test_db_session: Asyn
         "description": "Deletes repository",
         "inputSchema": {"type": "object", "properties": {"repo_name": {"type": "string"}}}
     }
-    await sync_discovered_tools(
+    await register_trusted_server_and_tools(
         server_name=server_name,
         tools=[original_def],
         canonicalize_and_hash_fn=canonicalize_and_hash,
@@ -309,7 +308,7 @@ async def test_hash_match_continues_pipeline_without_executing_tool(test_db_sess
         "description": "Echoes message",
         "inputSchema": {"type": "object", "properties": {"message": {"type": "string"}}}
     }
-    await sync_discovered_tools(
+    await register_trusted_server_and_tools(
         server_name=server_name,
         tools=[original_def],
         canonicalize_and_hash_fn=canonicalize_and_hash,
@@ -340,7 +339,7 @@ async def test_hash_match_continues_pipeline_without_executing_tool(test_db_sess
 
 @pytest.mark.asyncio
 async def test_fail_closed_on_unapproved_or_missing_hash():
-    """Test 8: Unapproved tool or missing definition fails-closed with BLOCK."""
+    """Test 8: Unapproved tool or missing definition fails-closed with BLOCK (NO_APPROVED_BASELINE)."""
     async def empty_hash_provider(s_name, t_name):
         return None
 
@@ -359,3 +358,4 @@ async def test_fail_closed_on_unapproved_or_missing_hash():
     assert result.passed is False
     assert result.hard_block is True
     assert "Fail-Closed" in result.explanation
+    assert "NO_APPROVED_BASELINE" in result.explanation

@@ -16,7 +16,7 @@ from mcpath.backend.persistence.database import (
     get_engine,
     init_db,
     register_server,
-    sync_discovered_tools,
+    register_trusted_server_and_tools,
     get_approved_hash,
     persist_security_event,
 )
@@ -39,7 +39,7 @@ __all__ = [
     "get_engine",
     "init_db",
     "register_server",
-    "sync_discovered_tools",
+    "register_trusted_server_and_tools",
     "get_approved_hash",
     "persist_security_event",
 ]

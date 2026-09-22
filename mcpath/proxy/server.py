@@ -11,10 +11,8 @@ from mcp.client.session import ClientSession
 from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 import mcp.types as types
-from mcpath.backend.persistence.database import sync_discovered_tools
 from mcpath.pipeline.pipeline_runner import PipelineRunner
 from mcpath.pipeline.stage import PipelineContext
-from mcpath.pipeline.stages.stage1_hash import canonicalize_and_hash
 from mcpath.proxy.client_manager import DownstreamClientManager
 from mcpath.risk_engine.explainability import format_explanation
 from mcpath.risk_engine.models import EnforcementDecision, SecurityEventRecord
@@ -26,8 +24,7 @@ def create_proxy_server(
     client_manager: DownstreamClientManager,
     downstream_session: ClientSession,
     pipeline_runner: Optional[PipelineRunner] = None,
-    server_name: str = "mcpath-proxy",
-    sync_tools_to_db: bool = True
+    server_name: str = "mcpath-proxy"
 ) -> Server:
     """Create configured MCP Server instance that routes through the security pipeline."""
     runner = pipeline_runner or PipelineRunner()
@@ -36,24 +33,10 @@ def create_proxy_server(
         context: Any,
         params: Optional[types.PaginatedRequestParams] = None
     ) -> types.ListToolsResult:
-        """Intercept tools/list, cache definitions for integrity checks, sync approved hashes to DB."""
+        """Intercept tools/list, cache definitions for runtime integrity checks, forward to client."""
         logger.info("Intercepted tools/list request for server '%s'", client_manager.server_name)
         result = await client_manager.list_tools(downstream_session, params=params)
-        logger.info("Discovered %d tools from downstream server", len(result.tools))
-
-        # Sync discovered tools to database for Stage 1 initial approval
-        if sync_tools_to_db:
-            try:
-                tools_data = [t.model_dump(mode="json") for t in result.tools]
-                await sync_discovered_tools(
-                    server_name=client_manager.server_name,
-                    tools=tools_data,
-                    canonicalize_and_hash_fn=canonicalize_and_hash
-                )
-                logger.info("Synced %d tool definitions and approved hashes to database", len(tools_data))
-            except Exception as e:
-                logger.warning("Database sync during tool discovery skipped/failed: %s", e)
-
+        logger.info("Discovered %d tools from downstream server '%s'", len(result.tools), client_manager.server_name)
         return result
 
     async def handle_call_tool(
@@ -64,10 +47,17 @@ def create_proxy_server(
         tool_name = params.name
         arguments = params.arguments or {}
         timestamp = datetime.now(timezone.utc).isoformat()
-        logger.info("Intercepted tools/call for tool='%s' with arguments=%s", tool_name, list(arguments.keys()))
+        logger.info("Intercepted tools/call for tool='%s' on server='%s'", tool_name, client_manager.server_name)
 
-        # Look up tool definition from cache (for Stage 1 hash verification)
+        # Look up tool definition from discovery cache
         tool_def = client_manager.get_tool_definition(tool_name)
+        if not tool_def:
+            # If not in memory cache, query downstream once to discover current definition
+            try:
+                await client_manager.list_tools(downstream_session)
+                tool_def = client_manager.get_tool_definition(tool_name)
+            except Exception as e:
+                logger.warning("Could not refresh tool discovery for '%s': %s", tool_name, e)
 
         event = SecurityEventRecord(
             timestamp=timestamp,
@@ -84,12 +74,12 @@ def create_proxy_server(
             event_record=event
         )
 
-        # 1. Pre-execution pipeline (Stages 1 - 4 + Pre-call Risk Engine)
+        # 1. Pre-execution pipeline (Stage 1 Hash Check + Stages 2-4 + Risk Engine)
         evaluated_event = await runner.run_pre_call(pipeline_ctx)
 
         if evaluated_event.decision == EnforcementDecision.BLOCK:
             explanation = format_explanation(evaluated_event)
-            logger.warning("EXECUTION BLOCKED by pipeline:\n%s", explanation)
+            logger.warning("EXECUTION BLOCKED by MCPath Proxy Security Gate:\n%s", explanation)
             return types.CallToolResult(
                 is_error=True,
                 content=[types.TextContent(type="text", text=explanation)]
@@ -124,7 +114,7 @@ def create_proxy_server(
         logger.info("Execution allowed and forwarded successfully for '%s'", tool_name)
         return downstream_result
 
-    # Handlers for resources and prompts (passthrough)
+    # Passthrough handlers for resources and prompts
     async def handle_list_resources(context: Any, params: Optional[types.PaginatedRequestParams] = None) -> types.ListResourcesResult:
         return await downstream_session.list_resources(params=params)
 

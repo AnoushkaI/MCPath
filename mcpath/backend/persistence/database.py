@@ -133,7 +133,7 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 
 # =========================================================================
-# Repository Helper Functions for Stage 1, Tool Discovery, and Events
+# Repository Functions for Stage 1, Trusted Registration, and Events
 # =========================================================================
 
 async def register_server(
@@ -143,7 +143,7 @@ async def register_server(
     env_vars: Optional[Dict[str, str]] = None,
     session: Optional[AsyncSession] = None
 ) -> ServerDB:
-    """Register or update an MCP server."""
+    """Register or update an MCP server record."""
     async def _op(s: AsyncSession):
         stmt = select(ServerDB).where(ServerDB.name == server_name)
         result = await s.execute(stmt)
@@ -171,37 +171,51 @@ async def register_server(
     return await _run_with_retry(_op, session=session)
 
 
-async def sync_discovered_tools(
+async def register_trusted_server_and_tools(
     server_name: str,
     tools: List[Dict[str, Any]],
     canonicalize_and_hash_fn: Any,
+    command: str = "python",
+    args: Optional[List[str]] = None,
+    env_vars: Optional[Dict[str, str]] = None,
+    approved_by: str = "admin:trusted_registration",
     session: Optional[AsyncSession] = None
 ) -> List[Tuple[ToolDB, ApprovedHashDB]]:
-    """Store discovered tools and establish initial approved hashes on trusted discovery."""
+    """Register server, tools, and compute/store approved SHA-256 baseline hashes (Idempotent)."""
     async def _op(s: AsyncSession):
-        # 1. Register/fetch server
+        # 1. Upsert server record
         stmt_srv = select(ServerDB).where(ServerDB.name == server_name)
         res_srv = await s.execute(stmt_srv)
         server = res_srv.scalar_one_or_none()
         if server is None:
             server = ServerDB(
                 name=server_name,
-                command="python",
-                args=[],
-                env_vars={},
+                command=command,
+                args=args or [],
+                env_vars=env_vars or {},
                 is_active=True
             )
             s.add(server)
+            await s.flush()
+        else:
+            server.command = command
+            server.args = args or []
+            server.env_vars = env_vars or {}
+            server.is_active = True
             await s.flush()
 
         synced_records = []
 
         for tool_dict in tools:
             tool_name = tool_dict.get("name", "")
-            description = tool_dict.get("description", "")
-            input_schema = tool_dict.get("inputSchema", {}) or tool_dict.get("input_schema", {})
+            description = tool_dict.get("description", "") or ""
+            input_schema = tool_dict.get("inputSchema")
+            if input_schema is None:
+                input_schema = tool_dict.get("input_schema", {})
+            if input_schema is None:
+                input_schema = {}
 
-            # Upsert tool
+            # 2. Upsert tool record
             stmt = select(ToolDB).where(ToolDB.server_id == server.id, ToolDB.name == tool_name)
             res = await s.execute(stmt)
             tool = res.scalar_one_or_none()
@@ -221,18 +235,29 @@ async def sync_discovered_tools(
                 tool.input_schema = input_schema
                 await s.flush()
 
-            # Check if an approved hash exists
+            # 3. Canonicalize and compute SHA-256 hash using shared canonicalizer
+            canonical_json, computed_sha = canonicalize_and_hash_fn(tool_dict)
+
+            # 4. Check existing active approved hash
             hash_stmt = select(ApprovedHashDB).where(
                 ApprovedHashDB.tool_id == tool.id,
                 ApprovedHashDB.is_active == True
             )
             hash_res = await s.execute(hash_stmt)
-            approved_hash_rec = hash_res.scalar_one_or_none()
+            active_hashes = hash_res.scalars().all()
 
-            canonical_json, computed_sha = canonicalize_and_hash_fn(tool_dict)
+            matched_existing = None
+            for ah in active_hashes:
+                if ah.hash_sha256 == computed_sha:
+                    matched_existing = ah
+                else:
+                    # Deactivate stale hash on re-registration
+                    ah.is_active = False
+                    ah.revoked_at = datetime.now(timezone.utc)
 
-            if approved_hash_rec is None:
-                # Initial trusted discovery approval
+            if matched_existing is not None:
+                approved_hash_rec = matched_existing
+            else:
                 approved_hash_rec = ApprovedHashDB(
                     tool_id=tool.id,
                     server_name=server_name,
@@ -240,7 +265,8 @@ async def sync_discovered_tools(
                     canonical_json=canonical_json,
                     hash_sha256=computed_sha,
                     is_active=True,
-                    approved_by="system:initial_discovery"
+                    approved_by=approved_by,
+                    approved_at=datetime.now(timezone.utc)
                 )
                 s.add(approved_hash_rec)
                 await s.flush()
@@ -357,3 +383,7 @@ async def persist_security_event(
         return sec_event
 
     return await _run_with_retry(_op, session=session)
+
+
+# Backwards compatibility alias
+sync_discovered_tools = register_trusted_server_and_tools

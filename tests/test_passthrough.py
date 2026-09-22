@@ -10,16 +10,20 @@ import pytest
 from mcp.client._memory import create_client_server_memory_streams
 from mcp.client.session import ClientSession
 from mock_servers.sample_server import app as sample_backend
+from mcpath.backend.persistence.database import init_db, register_trusted_server_and_tools
 from mcpath.proxy.server import create_proxy_server
 from mcpath.proxy.client_manager import DownstreamClientManager
 from mcpath.config.settings import ServerDefinition
 from mcpath.pipeline.pipeline_runner import PipelineRunner
+from mcpath.pipeline.stages.stage1_hash import canonicalize_and_hash
 import mcp.types as types
 
 
 @pytest.mark.asyncio
 async def test_end_to_end_proxy_passthrough():
     """Verify that an MCP client can connect to MCPath Proxy and call tools on the downstream server."""
+    await init_db()
+
     # Memory streams for Client -> MCPath Proxy
     async with create_client_server_memory_streams() as (c2p_client_streams, c2p_server_streams):
         # Memory streams for MCPath Proxy -> Downstream Server
@@ -45,6 +49,15 @@ async def test_end_to_end_proxy_passthrough():
 
                     server_def = ServerDefinition(command="mock", args=[])
                     client_manager = DownstreamClientManager(server_def, server_name="sample-server")
+
+                    # Register trusted baseline in DB for Stage 1
+                    raw_tools = await downstream_session.list_tools()
+                    tools_data = [t.model_dump(mode="json") for t in raw_tools.tools]
+                    await register_trusted_server_and_tools(
+                        server_name="sample-server",
+                        tools=tools_data,
+                        canonicalize_and_hash_fn=canonicalize_and_hash
+                    )
 
                     # 3. Create MCPath Proxy Server
                     pipeline_runner = PipelineRunner()

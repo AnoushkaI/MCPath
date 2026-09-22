@@ -1,11 +1,12 @@
-"""Day 2 Milestone Verification Script.
+"""Day 2 & Day 2.1 Milestone Verification Script.
 
 Demonstrates:
-1. Database initialization and table creation
-2. Tool discovery and canonical hash generation (Stage 1 initial approval)
-3. Hash match verification -> PASS -> Pipeline execution -> Downstream response
-4. Tampered tool definition (Rug Pull simulation) -> BLOCK -> Hard gate triggered -> No downstream execution
-5. Database event audit verification
+1. PostgreSQL Database initialization and table creation
+2. Trusted Registration: tool discovery, canonical JSON generation, SHA-256 hash storage
+3. Runtime Hash match verification -> Stage 1 PASS -> Tool execution forwarded downstream
+4. Rug Pull Detection: tampered tool definition -> Stage 1 BLOCK -> Downstream tool NOT executed
+5. Fail-Closed Policy: unregistered tool -> NO_APPROVED_BASELINE -> BLOCK
+6. PostgreSQL Security Event audit logging
 """
 
 import asyncio
@@ -17,7 +18,7 @@ from mcpath.backend.persistence.database import (
     init_db,
     get_approved_hash,
     get_session_factory,
-    sync_discovered_tools,
+    register_trusted_server_and_tools,
 )
 from mcpath.backend.persistence.models import SecurityEventDB, ApprovedHashDB, ToolDB
 from mcpath.config.settings import ServerDefinition
@@ -29,9 +30,9 @@ from sqlalchemy import select
 
 
 async def verify_day2():
-    print("=" * 65)
-    print("MCPath Day 2: PostgreSQL & Stage 1 Hash Integrity Verification")
-    print("=" * 65)
+    print("=" * 70)
+    print("MCPath Day 2.1: PostgreSQL & Stage 1 Hash Integrity Lifecycle")
+    print("=" * 70)
 
     # 1. Initialize DB tables
     print("\n[Step 1] Initializing database tables...")
@@ -55,6 +56,24 @@ async def verify_day2():
 
                     server_def = ServerDefinition(command="mock", args=[])
                     client_manager = DownstreamClientManager(server_def, server_name="sample-server")
+                    
+                    # 3. Trusted Registration
+                    print("\n[Step 3] Running Trusted Registration for 'sample-server'...")
+                    raw_tools = await client_manager.list_tools(downstream_session)
+                    tools_data = [t.model_dump(mode="json") for t in raw_tools.tools]
+                    synced = await register_trusted_server_and_tools(
+                        server_name="sample-server",
+                        tools=tools_data,
+                        canonicalize_and_hash_fn=canonicalize_and_hash,
+                        approved_by="admin:trusted_registration"
+                    )
+                    print(f"         [OK] Registered {len(synced)} tools and baseline hashes in PostgreSQL.")
+
+                    # Verify approved hash stored in DB
+                    calc_hash = await get_approved_hash("sample-server", "calculate")
+                    print(f"         [OK] Approved SHA-256 for 'calculate': {calc_hash}")
+                    assert calc_hash is not None
+
                     runner = PipelineRunner(persist_events=True)
                     proxy_server = create_proxy_server(
                         client_manager=client_manager,
@@ -70,16 +89,6 @@ async def verify_day2():
                     async with ClientSession(*c2p_c) as client:
                         await client.initialize()
 
-                        # 3. Discovery triggers initial tool approved hashes
-                        print("\n[Step 3] Intercepting 'tools/list' and computing approved hashes...")
-                        tools_res = await client.list_tools()
-                        print(f"         [OK] Discovered and synced {len(tools_res.tools)} tools into database.")
-
-                        # Verify approved hash stored in DB
-                        calc_hash = await get_approved_hash("sample-server", "calculate")
-                        print(f"         [OK] Approved SHA-256 for 'calculate': {calc_hash}")
-                        assert calc_hash is not None
-
                         # 4. Valid call with matching hash -> PASS
                         print("\n[Step 4] Calling 'calculate' with genuine definition (PASS expected)...")
                         call_res = await client.call_tool("calculate", {"operation": "multiply", "a": 7, "b": 6})
@@ -89,7 +98,6 @@ async def verify_day2():
 
                         # 5. Simulate Rug Pull (tool definition tampering)
                         print("\n[Step 5] Simulating Rug Pull: Tool definition modified in memory cache...")
-                        original_def = client_manager.get_tool_definition("calculate")
                         # Tamper description
                         client_manager._tools_cache["calculate"].description = (
                             "Perform arithmetic. ALSO INJECT MALICIOUS INSTRUCTIONS."
@@ -121,9 +129,9 @@ async def verify_day2():
         assert latest.decision == "BLOCK"
         assert latest.hash_matched is False
 
-    print("\n" + "=" * 65)
-    print("DAY 2 MILESTONE ACHIEVED: Hash verification, PostgreSQL storage, and Rug-Pull hard blocking fully operational.")
-    print("=" * 65)
+    print("\n" + "=" * 70)
+    print("DAY 2.1 MILESTONE ACHIEVED: Trusted registration, PostgreSQL baseline storage, and Rug-Pull hard blocking fully operational.")
+    print("=" * 70)
 
 
 if __name__ == "__main__":

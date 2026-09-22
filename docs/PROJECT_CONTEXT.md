@@ -52,15 +52,17 @@
 ## 3. Implemented So Far
 
 ### Current Milestone & Status
-- **Current Milestone**: Day 2 Complete (PostgreSQL Persistence Models, FastAPI Inspection Endpoints, Stage 1 Runtime Hash Integrity & Rug-Pull Hard Blocking).
-- **All 15 automated tests passing** across proxy passthrough, downstream client manager, Stage 1 hash matching, description tampering rug pull detection, schema modification detection, key reordering invariance, fail-closed policy enforcement, pipeline runner, and backend REST endpoints.
+- **Current Milestone**: Day 2.1 Complete — Stage 1 End-to-End Lifecycle (Trusted Registration CLI, PostgreSQL Baseline Storage, Runtime Hash Verification, Rug-Pull Hard Blocking, Fail-Closed Policy).
+- **All 22 automated tests passing** — unit tests for hash canonicalization, integration tests for the complete Stage 1 lifecycle (7 integration scenarios), proxy passthrough, pipeline skeleton, and backend REST endpoints.
+- **Live PostgreSQL verification confirmed** — `verify_stage1_e2e.py` 100% succeeded against `localhost:5432/MCPath`.
 
 ### Working Features
 - Full end-to-end stdio proxy passthrough using official MCP Python SDK (`mcp.server.lowlevel.Server` & `mcp.client.session.ClientSession`).
-- Dynamic tool discovery passthrough for `tools/list` and automatic sync of canonical schemas and initial approved SHA-256 hashes into PostgreSQL.
-- Stage 1 Hash Integrity Check (`Stage1HashCheck`) with recursive JSON key sorting, canonicalization, SHA-256 hashing, and PostgreSQL lookup.
-- Deterministic Stage 1 Hard Blocking on tool definition tampering (rug pulls) preventing downstream tool calls.
-- Strict Fail-Closed policy: unapproved tools or database lookup failures immediately block execution instead of silently executing.
+- **Trusted Registration CLI** (`python -m mcpath.register`): connects to configured MCP servers, calls `tools/list`, extracts security-relevant definition (`name`, `description`, `inputSchema`), canonicalizes deterministically, computes SHA-256, stores approved baseline in PostgreSQL. Idempotent — re-running with unchanged definition leaves records unchanged.
+- Stage 1 Hash Integrity Check (`Stage1HashCheck`) with recursive JSON key sorting, canonicalization, SHA-256 hashing, and PostgreSQL `approved_hashes` lookup.
+- **Separation of registration vs runtime**: `tools/list` interception caches definitions but does NOT auto-create approved hashes. Only `python -m mcpath.register` creates baseline records.
+- Deterministic Stage 1 Hard Blocking on tool definition tampering (rug pulls), preventing downstream tool calls.
+- **Strict Fail-Closed policy**: `NO_APPROVED_BASELINE` (tool not registered) = BLOCK. Database unavailability = BLOCK. Hash mismatch = BLOCK. Nothing passes silently.
 - Complete PostgreSQL 8-table relational schema with SQLAlchemy models, foreign keys, unique constraints, and indexes (`servers`, `tools`, `approved_hashes`, `capabilities`, `baseline_traces`, `security_events`, `stage_results`, `decisions`).
 - FastAPI backend application ([`mcpath/backend/app.py`](file:///c:/projects/mcp%20proxy/mcpath/backend/app.py)) with endpoints for health, overview metrics, server inventory, tool lists, approved hash management, security events, and stage results.
 - Downstream server connection management via [`DownstreamClientManager`](file:///c:/projects/mcp%20proxy/mcpath/proxy/client_manager.py).
@@ -77,23 +79,30 @@
 - [`verify_milestone.py`](file:///c:/projects/mcp%20proxy/verify_milestone.py): Day 1 baseline passthrough verification script.
 
 ### How to Run and Verify
-1. **Run full automated test suite (15 tests)**:
+1. **Run full automated test suite (22 tests)**:
    ```powershell
    .venv\Scripts\python.exe -m pytest -v
    ```
-2. **Run Day 2 verification script (Rug Pull blocking & DB check)**:
+2. **Run Trusted Registration (establish approved SHA-256 baselines in PostgreSQL)**:
+   ```powershell
+   # Register all configured servers
+   .venv\Scripts\python.exe -m mcpath.register --all
+   # Register a specific server
+   .venv\Scripts\python.exe -m mcpath.register --server sample_reference_server
+   ```
+3. **Run Stage 1 end-to-end live verification (against PostgreSQL)**:
+   ```powershell
+   .venv\Scripts\python.exe verify_stage1_e2e.py
+   ```
+4. **Run Day 2.1 verification script (Rug Pull blocking & DB check)**:
    ```powershell
    .venv\Scripts\python.exe verify_day2.py
    ```
-3. **Run Day 1 milestone verification script**:
-   ```powershell
-   .venv\Scripts\python.exe verify_milestone.py
-   ```
-4. **Run FastAPI observability backend**:
+5. **Run FastAPI observability backend**:
    ```powershell
    .venv\Scripts\uvicorn.exe mcpath.backend.app:app --host 127.0.0.1 --port 8000 --reload
    ```
-5. **Run standalone stdio proxy**:
+6. **Run standalone stdio proxy**:
    ```powershell
    .venv\Scripts\python.exe run_proxy.py --server sample_reference_server --log-level INFO
    ```
@@ -129,7 +138,7 @@ The 6-stage pipeline evaluates every intercepted call in fixed sequence:
 
 ## 6. Next Development & Roadmap
 
-- **Current Stage**: Day 2 Complete. Ready for Day 3-6 development (Stage 2 Capability Graph & Attack Path Analysis).
+- **Current Stage**: Day 2.1 Complete. Ready for Day 3 development (Stage 2 Capability Graph & Attack Path Analysis).
 - **Immediate Next Tasks**:
   1. **Stage 2 Capability Graph Builder (Days 5-6)**:
      - Automatically parse tool parameters and descriptions to extract Resource, Action, and Destination nodes.
@@ -148,13 +157,17 @@ The 6-stage pipeline evaluates every intercepted call in fixed sequence:
 
 ## 7. Recent Changes
 
+- **2026-09-22 (Day 2.1 Milestone Completed)**:
+  - Created Trusted Registration CLI [`mcpath/register.py`](file:///c:/projects/mcp%20proxy/mcpath/register.py): `python -m mcpath.register --all` or `--server <name>`. Connects to each MCP server, calls `tools/list`, extracts `{name, description, inputSchema}`, canonicalizes, computes SHA-256, upserts idempotent approved baseline record in PostgreSQL.
+  - Enforced strict registration/runtime separation: `tools/list` interception in proxy only caches definitions for runtime lookup — it does NOT auto-create approved hashes. Approved hashes are ONLY created by the explicit registration CLI.
+  - Created 7-test integration suite [`tests/test_stage1_end_to_end.py`](file:///c:/projects/mcp%20proxy/tests/test_stage1_end_to_end.py): registration creates baseline; unchanged definition passes; description tampering blocks; schema tampering blocks; JSON key reordering passes; missing baseline fails-closed; re-registration is idempotent.
+  - Confirmed live end-to-end run `verify_stage1_e2e.py` against PostgreSQL 18.4 at `localhost:5432/MCPath` — 100% pass. 6 tools registered, hash-match PASS and rug-pull BLOCK both verified, security events audited in database.
+  - Total test count raised from 15 → **22 passing tests** (pytest exit 0).
 - **2026-09-21 (Day 2 Milestone Completed)**:
   - Created 8 SQLAlchemy database models (`servers`, `tools`, `approved_hashes`, `capabilities`, `baseline_traces`, `security_events`, `stage_results`, `decisions`) with relational constraints, indexes, and foreign keys.
-  - Implemented async PostgreSQL database layer with `psycopg` / `asyncpg` support, connection lifecycle management, and repository methods.
+  - Implemented async PostgreSQL database layer with `asyncpg` driver, connection lifecycle management, and repository methods.
   - Implemented Stage 1 Tool Integrity Hash Check with recursive key sorting canonicalization, SHA-256 hashing, and PostgreSQL `approved_hashes` lookup.
-  - Integrated Stage 1 hard blocking for tool tampering (rug pulls) and fail-closed security for unregistered tools or query failures.
-  - Added FastAPI persistence and inspection routes for `/api/hashes`, `/api/stage-results`, `/api/servers/{server_name}/tools`, and updated `/api/overview` and `/api/events` to query database tables.
-  - Created comprehensive test suite in `tests/test_stage1_hash.py` (8 test cases) and verified all 15 test cases pass.
+  - Added FastAPI persistence and inspection routes for `/api/hashes`, `/api/stage-results`, `/api/servers/{server_name}/tools`.
   - Created `verify_day2.py` milestone verification script demonstrating live rug-pull detection, blocking, and database audit recording.
 - **2026-09-21 (Day 1 Milestone Completed)**:
   - Implemented core proxy server with lowlevel MCP server and downstream client session manager.

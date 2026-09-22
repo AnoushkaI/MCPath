@@ -3,7 +3,7 @@
 Combines capability, intent, behaviour, and response scores into an overall decision.
 Rules:
 - Strictly deterministic logic: NO LLM makes the enforcement decision.
-- Hard-block gates evaluated first (e.g. hash mismatch upstream, confirmed exfiltration path).
+- Hard-block gates evaluated first (e.g. hash mismatch upstream, no approved baseline, confirmed exfiltration path).
 - Explicit thresholds for ALLOW / HOLD / BLOCK.
 """
 
@@ -28,26 +28,27 @@ class RiskEngine:
         self,
         event: SecurityEventRecord
     ) -> SecurityEventRecord:
-        """Evaluate event scores and hard-block gates deterministically.
-
-        [TODO Day 11: Implement full weighted combination logic and multi-stage gates]
-        """
-        # 1. Check upstream hard gates (e.g. Hash mismatch from Stage 1)
+        """Evaluate event scores and hard-block gates deterministically."""
+        # 1. Check upstream Stage 1 hard gates (Hash mismatch or missing baseline)
         if event.hash_matched is False:
             event.decision = EnforcementDecision.BLOCK
-            event.hard_gate_triggered = "hash mismatch"
-            event.reason = "Tool definition changed after approval (rug pull detected)"
+            if event.expected_hash is None:
+                event.hard_gate_triggered = "no approved baseline"
+                event.reason = "Tool has no active approved baseline in PostgreSQL database (NO_APPROVED_BASELINE)"
+            else:
+                event.hard_gate_triggered = "hash mismatch"
+                event.reason = "Tool definition changed after approval (rug pull detected)"
             event.action_taken = "Tool call not forwarded"
             return event
 
-        # 2. Check individual critical scores (Day 11 TODO)
+        # 2. Check individual critical scores (Stages 2 - 5)
         scores = event.scores
         active_scores = [s for s in [scores.capability_risk, scores.intent_risk, scores.behaviour_risk, scores.response_risk] if s is not None]
 
         if not active_scores:
-            # Default Day 1 passthrough
+            # Default passthrough when all gates passed and no downstream risk flags
             event.decision = EnforcementDecision.ALLOW
-            event.reason = "Passthrough mode active (Day 1)"
+            event.reason = "Tool definition verified against approved baseline"
             event.action_taken = "Tool call forwarded"
             return event
 
