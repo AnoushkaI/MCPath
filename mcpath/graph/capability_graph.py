@@ -38,6 +38,21 @@ class CapabilityGraph:
             self.graph.add_node(name, type="Tool", server=server_name)
             self.graph.add_edge("Agent", name, relation="CAN_CALL")
 
+    def rebuild_for_all_servers(self, server_tools: Dict[str, List[Dict]]):
+        """Rebuild capability graph dynamically representing all currently configured servers."""
+        self.graph.clear()
+        self.graph.add_node("Agent", type="Agent")
+        for server_name, tools in server_tools.items():
+            self.rebuild_from_tools(server_name, tools)
+
+    def remove_server(self, server_name: str):
+        """Remove all tools associated with a disconnected or removed server."""
+        nodes_to_remove = [
+            n for n, data in self.graph.nodes(data=True)
+            if data.get("server") == server_name
+        ]
+        self.graph.remove_nodes_from(nodes_to_remove)
+
     def get_paths_to_external(self, start_tool: str) -> List[List[str]]:
         """Find all causal paths from start_tool leading to an External Destination."""
         # Day 1 placeholder

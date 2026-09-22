@@ -20,7 +20,8 @@ class ServerDefinition(BaseSettings):
 
 class ServerConfig(BaseSettings):
     """Collection of configured downstream MCP servers."""
-    active_server: str = "sample_reference_server"
+    active_server: str = "filesystem"
+    active_servers: list[str] = Field(default_factory=lambda: ["filesystem", "git", "postgres-mcp"])
     servers: dict[str, ServerDefinition] = Field(default_factory=dict)
 
     @classmethod

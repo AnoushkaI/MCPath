@@ -86,3 +86,30 @@ async def switch_server(req: SwitchServerRequest):
             detail=f"Server '{req.server_name}' not found. Available: {list(config.servers.keys())}"
         )
     return {"status": "success", "active_server": req.server_name}
+
+
+@router.post("/reload")
+async def reload_servers():
+    """Dynamically reload configured downstream MCP servers.
+
+    - Reads current MCPath server configuration
+    - Detects added/removed/changed servers
+    - Disconnects removed servers and connects newly added servers
+    - Rediscovers tools and recomputes exposed-tool collision mapping
+    - Rebuilds dynamic capability graph
+    - Claude Desktop configuration remains completely unchanged
+    """
+    from mcpath.proxy.client_manager import get_active_client_manager
+    mgr = get_active_client_manager()
+    if mgr is not None:
+        summary = await mgr.reload()
+        return summary
+
+    # If proxy is not currently running as stdio subprocess, return current config state
+    config = settings.get_server_config()
+    return {
+        "status": "success",
+        "message": "Proxy is not actively running in this process; reloaded configuration from disk",
+        "active_servers": getattr(config, "active_servers", [config.active_server]),
+        "configured_servers": list(config.servers.keys())
+    }

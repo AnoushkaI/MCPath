@@ -1,0 +1,30 @@
+{
+  "active_server": "filesystem",
+  "active_servers": ["filesystem", "git", "postgres-mcp"],
+  "servers": {
+    "sample_reference_server": {
+      "command": "python",
+      "args": ["mock_servers/sample_server.py"],
+      "env": {}
+    },
+    "filesystem": {
+      "command": "cmd",
+      "args": ["/c", "npx", "-y", "@modelcontextprotocol/server-filesystem", "${FILESYSTEM_ALLOWED_PATHS}"],
+      "env": {}
+    },
+    "git": {
+      "command": "uvx",
+      "args": ["mcp-server-git", "--repository", "${GIT_REPOSITORY_PATH}"],
+      "env": {
+        "PYTHONIOENCODING": "utf-8"
+      }
+    },
+    "postgres-mcp": {
+      "command": "cmd",
+      "args": ["/c", "npx", "-y", "@microsoft/postgres-mcp@latest", "run"],
+      "env": {
+        "POSTGRES_MCP_CONNECTION_STRING": "${POSTGRES_MCP_CONNECTION_STRING}"
+      }
+    }
+  }
+}

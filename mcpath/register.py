@@ -44,7 +44,7 @@ async def register_server_by_name(server_name: str) -> List[Dict[str, str]]:
     server_def = interpolate_server_config(server_def, settings)
     logger.info("Connecting to downstream server '%s' for trusted registration...", server_name)
 
-    client_manager = DownstreamClientManager(server_def, server_name=server_name)
+    client_manager = DownstreamClientManager(server_def=server_def, server_name=server_name)
     async with client_manager.session_context() as session:
         tools_res = await session.list_tools()
         tools = [t.model_dump(mode="json") for t in tools_res.tools]

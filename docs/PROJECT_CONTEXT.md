@@ -11,227 +11,253 @@
 - **The Problem It Solves**: In standard MCP setups, clients blindly trust connected tool definitions, tool invocations, and server responses. This exposes AI systems to tool rug pulls (changing tool schemas/descriptions after approval), capability chain exploits (e.g. reading customer PII and exfiltrating via email), prompt injection/jailbreak intents, anomalous behavior deviations, and sensitive data leakage in tool outputs.
 - **Where It Sits in MCP Architecture**: 
   - Standard setup: `MCP Client (Claude Desktop) <--- stdio/HTTP ---> MCP Server`
-  - MCPath setup: `MCP Client (Claude Desktop) <--- stdio ---> MCPath Proxy <--- stdio ---> MCP Server`
-  - MCPath acts as an intercepting transparent reverse proxy using the official MCP Python SDK (`mcp`).
+  - MCPath Multi-Server Architecture:
+    ```
+    Claude Desktop / Custom MCP Host
+                  │
+                  │ ONE stdio MCP connection (mcpath-proxy)
+                  ▼
+             MCPath Proxy
+                  │
+        ┌─────────┼─────────┐
+        ▼         ▼         ▼
+    Downstream  Downstream  Downstream
+    MCP Client  MCP Client  MCP Client
+    (Filesystem)  (Git)   (PostgreSQL)
+                  │
+                  ▼
+          MCPath Security Pipeline
+      Stage 1 → Stage 2 → Stage 3 → Stage 4
+                  │
+                  ▼
+        Risk Engine (Phase 1: Pre-Execution)
+                  │
+                  ▼ (ONLY IF ALLOW)
+        Target Downstream MCP Execution
+                  │
+                  ▼
+              Stage 5 (Response Risk)
+                  │
+                  ▼
+        Risk Engine (Phase 2: Post-Execution)
+                  │
+                  ▼
+         Return Sanitized/Verified Response
+    ```
 
 ---
 
-## 2. Current Architecture
+## 2. Multi-Server Target Architecture & Core Components
 
 ```
 +------------------------------------+
 |  Claude Desktop / Custom MCP Host  |
 +------------------------------------+
-                  | (stdio MCP JSON-RPC)
+                  | (ONE stdio MCP JSON-RPC connection)
                   v
 +------------------------------------+        Async Log Event        +-------------------------+      +-------------------+
 |         MCPath Proxy Core          | ----------------------------> | FastAPI Backend Service | ---> |    PostgreSQL     |
-+------------------------------------+     (Non-blocking write)      +-------------------------+      | (SQLite fallback) |
-  Stage 1: Tool Integrity Hash Check                                                                   +-------------------+
-  Stage 2: Capability Risk Graph                                                                                 |
-  Stage 3: Semantic Intent Verify                                                                                v
-  Stage 4: Behaviour Deviation                                                                        +-------------------+
-  Stage 5: Response Risk Inspection                                                                   | Streamlit / React |
-  Stage 6: Deterministic Risk Engine                                                                  | Security Dashboard|
-                  |                                                                                   +-------------------+
-                  v (Forwarded ONLY on ALLOW)
-+------------------------------------+
-|        Downstream MCP Server       |
-+------------------------------------+
++------------------------------------+     (Non-blocking write)      +-------------------------+      | (Primary Storage) |
+  DownstreamClientManager                                                                             +-------------------+
+    ├── Filesystem ClientSession                                                                                |
+    ├── Git ClientSession                                                                                       v
+    └── PostgreSQL ClientSession                                                                      +-------------------+
+  Pipeline:                                                                                           | Streamlit / React |
+    Phase 1 (Pre-Execution):                                                                          | Security Dashboard|
+      Stage 1: Tool Integrity Hash Check (PostgreSQL Approved Baseline)                              +-------------------+
+      Stage 2: Dynamic Capability Graph Risk
+      Stage 3: Semantic Intent Verification
+      Stage 4: Behaviour Deviation Detection
+      Risk Engine Evaluation (ALLOW / HOLD / BLOCK)
+    Phase 2 (Post-Execution):
+      Target Downstream Subprocess Invocation (Only if ALLOW)
+      Stage 5: Tool Response Risk Inspection
+      Risk Engine Final Evaluation
 ```
 
 ### Core Subsystems & Components:
-1. **Live Enforcement Path**: `MCP Client -> MCPath Proxy -> MCP Server`. Intercepts `tools/list` and `tools/call`. Evaluates requests through the 6-stage pipeline and forwards them only if the deterministic Risk Engine decides `ALLOW`.
-2. **Observability Path (Separation of Concerns)**: `MCPath Proxy -> FastAPI Backend -> PostgreSQL -> Dashboard`. Emits structured `SecurityEventRecord`, `StageResultDB`, and `DecisionDB` payloads. The dashboard and backend are strictly read-only observers and have zero influence over live enforcement decisions.
-3. **Six-Stage Security Pipeline**: Sequential evaluation pipeline running per tool call request and response.
-4. **Causal Capability Graph ([CapabilityGraph](file:///c:/projects/mcp%20proxy/mcpath/graph/capability_graph.py#L24-L50))**: Built using NetworkX to map Agent $\rightarrow$ Tool $\rightarrow$ Resource $\rightarrow$ Action $\rightarrow$ External Destination relations and compute multi-hop risk.
-5. **Attributable Explainability**: Every security event produces an itemized breakdown across all 6 stages (hard gates, individual risk scores, triggering reasons) rather than an opaque blended score.
+1. **Single Claude Connector**: Claude Desktop connects to exactly ONE `mcpath-proxy` server entry point without requiring any `--server` flags in Claude's configuration.
+2. **Multi-Server Downstream Manager (`DownstreamClientManager`)**:
+   - Maintains independent MCP client transports and sessions (`ClientSession`) for all configured downstream servers.
+   - Fault-Isolated: A connection failure in one downstream server (e.g. Filesystem) does not terminate or impact others (Git or PostgreSQL).
+   - Failed servers are logged in `unavailable_servers` and their tools are excluded from `tools/list`.
+   - Never falls back to `sample_reference_server` (which is strictly for unit/regression tests).
+3. **Aggregated Tool Catalog & Collision Handling**:
+   - `tools/list` returns a single combined catalog across all healthy downstream servers.
+   - Unique tools retain their original tool name, description, and input schema.
+   - Colliding tools (identical name across multiple servers) are deterministically namespaced as `{server_name}_{tool_name}`.
+   - An exact internal registry maps every `exposed_name -> (server_name, original_tool_name, tool_definition, approved_hash)`.
+4. **Routed `tools/call`**:
+   - Identifies the owning server from the exposed tool name.
+   - Evaluates the call against the owning server's approved baseline hash in Stage 1.
+   - Evaluates Stages 2-4 and Risk Engine Phase 1.
+   - On ALLOW, routes invocation directly to the owning server's `ClientSession` using `original_tool_name`.
+   - Tools belonging to Server A can NEVER be routed to Server B.
+5. **Two-Phase Deterministic Risk Engine Enforcement**:
+   - The Risk Engine is the SOLE deterministic enforcement authority. No LLM ever makes ALLOW/BLOCK/HOLD decisions.
+   - Phase 1 (Pre-Execution): Evaluates Stages 1–4. If BLOCK/HOLD, stops execution immediately with zero downstream call.
+   - Phase 2 (Post-Execution): If Phase 1 allowed and downstream tool executed, evaluates Stage 5 response risk and finalizes decision.
+   - On Stage 1 Hard Block (hash mismatch or missing baseline), Stages 2–5 are explicitly recorded as `NOT_EXECUTED` (skipped).
+6. **Dynamic Server Reloading (`POST /api/servers/reload`)**:
+   - Reads current `server_config.json`, detects added/removed/changed servers.
+   - Disconnects removed servers and establishes connections to newly added servers.
+   - Rediscovers tools, recomputes collision mappings, and dynamically updates the capability graph.
+   - Claude Desktop configuration remains completely unchanged.
+7. **Observability Path**: `MCPath Proxy -> FastAPI Backend -> PostgreSQL -> Dashboard`. Emits structured `SecurityEventRecord`, `StageResultDB`, and `DecisionDB` records. The backend and dashboard are strictly read-only observers and have zero influence over live enforcement decisions.
 
 ---
 
 ## 3. Implemented So Far
 
 ### Current Milestone & Status
-- **Current Milestone**: Day 2.1 Complete — Stage 1 End-to-End Lifecycle (Trusted Registration CLI, PostgreSQL Baseline Storage, Runtime Hash Verification, Rug-Pull Hard Blocking, Fail-Closed Policy).
-- **All 22 automated tests passing** — unit tests for hash canonicalization, integration tests for the complete Stage 1 lifecycle (7 integration scenarios), proxy passthrough, pipeline skeleton, and backend REST endpoints.
-- **Live PostgreSQL verification confirmed** — `verify_stage1_e2e.py` 100% succeeded against `localhost:5432/MCPath`.
+- **Current Milestone**: Multi-Server Architecture Complete — One Claude Connector proxying to Filesystem + Git + PostgreSQL.
+- **All 28 automated tests passing** — unit tests for hash canonicalization, multi-server lifecycle, aggregated catalog, collision resolution, routing isolation, Stage 1 rug-pull blocking, fail-closed policy, dynamic reload, and backend endpoints.
+- **Live Multi-Server & Real MCP Server Verification Confirmed** — `verify_real_servers.py` successfully connected to Filesystem, Git, and PostgreSQL simultaneously, aggregated 39 tools, routed calls through Stage 1 to each real server, and passed the controlled Claude Desktop rug-pull simulation.
 
 ### Working Features
-- Full end-to-end stdio proxy passthrough using official MCP Python SDK (`mcp.server.lowlevel.Server` & `mcp.client.session.ClientSession`).
-- **Trusted Registration CLI** (`python -m mcpath.register`): connects to configured MCP servers, calls `tools/list`, extracts security-relevant definition (`name`, `description`, `inputSchema`), canonicalizes deterministically, computes SHA-256, stores approved baseline in PostgreSQL. Idempotent — re-running with unchanged definition leaves records unchanged.
-- Stage 1 Hash Integrity Check (`Stage1HashCheck`) with recursive JSON key sorting, canonicalization, SHA-256 hashing, and PostgreSQL `approved_hashes` lookup.
-- **Separation of registration vs runtime**: `tools/list` interception caches definitions but does NOT auto-create approved hashes. Only `python -m mcpath.register` creates baseline records.
-- Deterministic Stage 1 Hard Blocking on tool definition tampering (rug pulls), preventing downstream tool calls.
-- **Strict Fail-Closed policy**: `NO_APPROVED_BASELINE` (tool not registered) = BLOCK. Database unavailability = BLOCK. Hash mismatch = BLOCK. Nothing passes silently.
-- Complete PostgreSQL 8-table relational schema with SQLAlchemy models, foreign keys, unique constraints, and indexes (`servers`, `tools`, `approved_hashes`, `capabilities`, `baseline_traces`, `security_events`, `stage_results`, `decisions`).
-- FastAPI backend application ([`mcpath/backend/app.py`](file:///c:/projects/mcp%20proxy/mcpath/backend/app.py)) with endpoints for health, overview metrics, server inventory, tool lists, approved hash management, security events, and stage results.
-- Downstream server connection management via [`DownstreamClientManager`](file:///c:/projects/mcp%20proxy/mcpath/proxy/client_manager.py).
-- **Real MCP server support** — Filesystem (npx), Git (uvx), Microsoft PostgreSQL (npx) servers are all configured and verified:
-  - `filesystem`: `cmd /c npx -y @modelcontextprotocol/server-filesystem <path>` (14 tools, path from `FILESYSTEM_ALLOWED_PATHS`).
-  - `git`: `uvx mcp-server-git --repository <path>` (12 tools, path from `GIT_REPOSITORY_PATH`).
-  - `postgres-mcp`: `cmd /c npx -y @microsoft/postgres-mcp@latest run` (13 tools, connection URI from `POSTGRES_MCP_CONNECTION_STRING`, targeting isolated `mcpath_demo_db`).
-  - Switching servers requires only a `--server <name>` flag; no pipeline code changes.
-- **${VAR} env-var interpolation** in `server_config.json` args/env via `interpolate_server_config()` — machine-specific paths and credentials stay in `.env` only.
-- Reference Mock MCP Server ([`mock_servers/sample_server.py`](file:///c:/projects/mcp%20proxy/mock_servers/sample_server.py)) providing `echo`, `calculate`, `read_customer` (sensitive PII), `send_email` (exfiltration endpoint), `summarize_repository`, and `delete_repository`. Kept strictly for test/regression fixtures (`sample_reference_server`).
+- Single stdio proxy entrypoint for Claude Desktop (`run_proxy.py` / `mcpath.proxy.run`) managing multiple downstream servers.
+- `DownstreamClientManager` with independent `AsyncExitStack` lifecycle per server, graceful fault isolation, and tool catalog aggregation.
+- Deterministic namespace collision resolution: colliding tool names become `{server_name}_{tool_name}`; unique tools remain un-prefixed.
+- Strict cross-server routing: tool calls route only to the owning server's `ClientSession` using the original tool name.
+- Two-phase Risk Engine enforcement: pre-call (Stages 1-4) and post-call (Stage 5).
+- Trusted Registration CLI (`python -m mcpath.register --all` or `--server <name>`) establishing approved baseline hashes in PostgreSQL.
+- Discovery separation: runtime tool discovery and reload do NOT auto-approve hashes. Unapproved tools fail-closed with `NO_APPROVED_BASELINE`.
+- Stage 1 Hash Integrity Check (`Stage1HashCheck`) with recursive JSON key sorting, canonicalization, SHA-256 hashing, and PostgreSQL `approved_hashes` lookup per `(server_name, tool_name)`.
+- Dynamic controlled server reload endpoint (`POST /api/servers/reload`) refreshing active servers and rebuilding the capability graph without restarting Claude Desktop.
+- PostgreSQL 8-table relational schema with SQLAlchemy models, foreign keys, unique constraints, and indexes.
+- FastAPI backend application (`mcpath/backend/app.py`) with routes for overview, server inventory, tools, hashes, stage results, and reload.
+- Real MCP server support:
+  - `filesystem`: `cmd /c npx -y @modelcontextprotocol/server-filesystem ${FILESYSTEM_ALLOWED_PATHS}` (14 tools)
+  - `git`: `uvx mcp-server-git --repository ${GIT_REPOSITORY_PATH}` (12 tools)
+  - `postgres-mcp`: `cmd /c npx -y @microsoft/postgres-mcp@latest run` with `${POSTGRES_MCP_CONNECTION_STRING}` (13 tools)
+  - Combined catalog: 39 tools exposed to Claude through one connection.
 
-### Important Files & Modules
-- [`mcpath/pipeline/stages/stage1_hash.py`](file:///c:/projects/mcp%20proxy/mcpath/pipeline/stages/stage1_hash.py): Stage 1 Tool Integrity Hash Check implementation.
-- [`mcpath/backend/persistence/models.py`](file:///c:/projects/mcp%20proxy/mcpath/backend/persistence/models.py): SQLAlchemy models for all 8 database tables.
-- [`mcpath/backend/persistence/database.py`](file:///c:/projects/mcp%20proxy/mcpath/backend/persistence/database.py): Async database engine, session management, repository functions, and credential-redacting server registration.
-- [`mcpath/backend/routes/`](file:///c:/projects/mcp%20proxy/mcpath/backend/routes/): FastAPI route modules for `overview`, `servers`, `events`, `hashes`, and `stage_results`.
-- [`mcpath/proxy/server.py`](file:///c:/projects/mcp%20proxy/mcpath/proxy/server.py): Intercepting MCP server handlers for `list_tools` and `call_tool`.
-- [`mcpath/proxy/client_manager.py`](file:///c:/projects/mcp%20proxy/mcpath/proxy/client_manager.py): Downstream MCP client manager (merges full OS env for Node/uvx subprocess compatibility).
-- [`mcpath/proxy/passthrough.py`](file:///c:/projects/mcp%20proxy/mcpath/proxy/passthrough.py): Passthrough coordinator — calls `interpolate_server_config()` before launching subprocess.
-- [`mcpath/config/settings.py`](file:///c:/projects/mcp%20proxy/mcpath/config/settings.py): Settings class with `FILESYSTEM_ALLOWED_PATHS`, `GIT_REPOSITORY_PATH`, `POSTGRES_MCP_CONNECTION_STRING`, and `interpolate_server_config()` utility.
-- [`config/server_config.json`](file:///c:/projects/mcp%20proxy/config/server_config.json): Declarative server registry (filesystem, git, postgres-mcp, sample_reference_server).
-- [`mcpath/pipeline/pipeline_runner.py`](file:///c:/projects/mcp%20proxy/mcpath/pipeline/pipeline_runner.py): Ordered stage execution coordinator with async DB logging.
-- [`verify_real_servers.py`](file:///c:/projects/mcp%20proxy/verify_real_servers.py): Real-server end-to-end verification (full production flow for filesystem, git, postgres-mcp).
-- [`verify_stage1_e2e.py`](file:///c:/projects/mcp%20proxy/verify_stage1_e2e.py): Stage 1 lifecycle verification against PostgreSQL.
-- [`verify_day2.py`](file:///c:/projects/mcp%20proxy/verify_day2.py): Day 2.1 milestone verification script.
+---
 
-### How to Run and Verify
-1. **Run full automated test suite (22 tests)**:
+## 4. Claude Desktop Configuration
+
+Claude Desktop requires ONLY ONE entry in its `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "mcpath-proxy": {
+      "command": "C:\\projects\\mcp proxy\\.venv\\Scripts\\python.exe",
+      "args": [
+        "C:\\projects\\mcp proxy\\run_proxy.py"
+      ]
+    }
+  }
+}
+```
+
+No `--server` arguments are required. MCPath automatically reads `config/server_config.json` and manages all configured active downstream servers (`filesystem`, `git`, `postgres-mcp`).
+
+---
+
+## 5. Security Pipeline & Evaluation Phases
+
+The pipeline evaluates every intercepted call in two deterministic phases:
+
+```
+[Tool Call Received]
+        │
+        ▼
+   [Stage 1: Tool Integrity Hash Check]
+        │
+        ├─► Mismatch / Missing Baseline ──► [BLOCK] (Downstream NOT called, Stages 2-5 marked NOT_EXECUTED)
+        ▼ Match
+   [Stage 2: Dynamic Capability Risk Graph]
+        ▼
+   [Stage 3: Semantic Intent Verification]
+        ▼
+   [Stage 4: Behaviour Deviation Detection]
+        ▼
+   [Risk Engine: Phase 1 Pre-Execution Evaluation]
+        │
+        ├─► Score >= Threshold / Hard Gate ──► [BLOCK / HOLD] (Downstream NOT called)
+        ▼ ALLOW
+   [Downstream MCP Execution] ──► Target server session invoked with original_tool_name
+        │
+        ▼ Tool Response
+   [Stage 5: Response Risk Inspection]
+        ▼
+   [Risk Engine: Phase 2 Post-Execution Final Evaluation]
+        │
+        ├─► Response Leak Detected ──► [BLOCK / HOLD] (Response redacted or blocked)
+        ▼ ALLOW
+   [Return Response to Client]
+```
+
+| Stage | Name | Role & Question Answered | Status |
+|---|---|---|---|
+| **Stage 1** | **Tool Integrity Hash Check** | *"Has this tool's definition changed since it was approved?"* Computes SHA-256 over canonicalized JSON and compares against PostgreSQL `approved_hashes`. Mismatches trigger immediate hard block without evaluating later stages (stops tool rug pulls). Fail-closed on missing baseline/DB error. | **IMPLEMENTED** |
+| **Stage 2** | **Capability Risk** | *"Can this tool access sensitive resources or chain to external exfiltration?"* Analyzes graph paths in NetworkX (Agent $\rightarrow$ Tool $\rightarrow$ Resource $\rightarrow$ Action $\rightarrow$ Destination) to produce risk score $[0, 100]$. Dynamically represents all configured servers. | **SKELETON / READY FOR EXPANSION** |
+| **Stage 3** | **Intent Verification** | *"Does the requested tool call align with the user's explicit prompt?"* Compares embeddings of user prompt vs tool call semantics to detect prompt injection/jailbreak manipulation. | **SKELETON / READY FOR EXPANSION** |
+| **Stage 4** | **Behaviour Deviation** | *"Is this call anomalous compared to historical baseline traces?"* Checks parameter sizes, invocation frequencies, and argument shapes against historical statistical baselines. | **SKELETON / READY FOR EXPANSION** |
+| **Stage 5** | **Response Risk Inspection** | *"Does the downstream server output leak sensitive data (PII, API keys, credentials)?"* Inspects tool outputs using fast regex heuristics and optional secondary bounded classifier. | **SKELETON / READY FOR EXPANSION** |
+| **Risk Engine** | **Deterministic Risk Engine** | *"What is the final enforcement decision?"* Evaluates hard-block gates first, then thresholds combined scores into `ALLOW`, `HOLD`, or `BLOCK`. Attaches complete explainability evidence. Evaluated in two phases: pre-call and post-call. | **IMPLEMENTED** |
+
+---
+
+## 6. How to Run and Verify
+
+1. **Run full automated test suite (28 tests)**:
    ```powershell
    .venv\Scripts\python.exe -m pytest -v
    ```
-2. **Run Trusted Registration (establish approved SHA-256 baselines in PostgreSQL)**:
+2. **Run multi-server proxy tests specifically**:
    ```powershell
-   # Register all configured servers (filesystem, git, postgres-mcp, sample)
-   .venv\Scripts\python.exe -m mcpath.register --all
-
-   # Register a specific server
-   .venv\Scripts\python.exe -m mcpath.register --server filesystem
-   .venv\Scripts\python.exe -m mcpath.register --server git
-   .venv\Scripts\python.exe -m mcpath.register --server postgres-mcp
+   .venv\Scripts\python.exe -m pytest tests/test_multi_server_proxy.py -v
    ```
-3. **Run real-server end-to-end verification (all 3 real servers + regression)**:
+3. **Run Trusted Registration for all configured servers**:
+   ```powershell
+   .venv\Scripts\python.exe -m mcpath.register --all
+   ```
+4. **Run Real Multi-Server End-to-End Verification (Filesystem + Git + PostgreSQL + Rug-Pull Test)**:
    ```powershell
    .venv\Scripts\python.exe verify_real_servers.py
-   # Or a single server:
-   .venv\Scripts\python.exe verify_real_servers.py --server postgres-mcp
    ```
-4. **Run Stage 1 end-to-end live verification (against PostgreSQL)**:
+5. **Run the Multi-Server Proxy for Claude Desktop**:
    ```powershell
-   .venv\Scripts\python.exe verify_stage1_e2e.py
-   ```
-5. **Run the proxy for a specific server**:
-   ```powershell
-   .venv\Scripts\python.exe run_proxy.py --server filesystem --log-level INFO
-   .venv\Scripts\python.exe run_proxy.py --server git --log-level INFO
-   .venv\Scripts\python.exe run_proxy.py --server postgres-mcp --log-level INFO
-   .venv\Scripts\python.exe run_proxy.py --server sample_reference_server --log-level INFO
-   ```l INFO
+   .venv\Scripts\python.exe run_proxy.py --log-level INFO
    ```
 6. **Run FastAPI observability backend**:
    ```powershell
    .venv\Scripts\uvicorn.exe mcpath.backend.app:app --host 127.0.0.1 --port 8000 --reload
    ```
-
----
-
-## 4. Security Pipeline
-
-The 6-stage pipeline evaluates every intercepted call in fixed sequence:
-
-| Stage | Name | Role & Question Answered | Status |
-|---|---|---|---|
-| **Stage 1** | **Tool Integrity Hash Check** | *"Has this tool's definition changed since it was approved?"* Computes SHA-256 over canonicalized JSON and compares against PostgreSQL `approved_hashes`. Mismatches trigger immediate hard block without evaluating later stages (stops tool rug pulls). Fail-closed on missing definition/DB error. | **IMPLEMENTED** (Full canonicalization, DB lookup, match/mismatch hard block, fail-closed policy) |
-| **Stage 2** | **Capability Risk** | *"Can this tool access sensitive resources or chain to external exfiltration?"* Analyzes graph paths in NetworkX (Agent $\rightarrow$ Tool $\rightarrow$ Resource $\rightarrow$ Action $\rightarrow$ Destination) to produce risk score $[0, 100]$. | **PLANNED / SKELETON** (NetworkX skeleton in place; schema extraction & path scoring planned) |
-| **Stage 3** | **Intent Verification** | *"Does the requested tool call align with the user's explicit prompt?"* Compares embeddings of user prompt vs tool call semantics to detect prompt injection/jailbreak manipulation. | **PLANNED / SKELETON** (Interface ready; embedding & cosine similarity model planned) |
-| **Stage 4** | **Behaviour Deviation** | *"Is this call anomalous compared to historical baseline traces?"* Checks parameter sizes, invocation frequencies, and argument shapes against historical statistical baselines. | **PLANNED / SKELETON** (Trace schema & model ready; statistical scoring planned) |
-| **Stage 5** | **Response Risk Inspection** | *"Does the downstream server output leak sensitive data (PII, API keys, credentials)?"* Inspects tool outputs using fast regex heuristics and optional secondary bounded classifier. | **PLANNED / SKELETON** (Regex heuristics & LLM classifier skeleton ready) |
-| **Stage 6** | **Deterministic Risk Engine** | *"What is the final enforcement decision?"* Evaluates hard-block gates first, then thresholds combined scores into `ALLOW`, `HOLD`, or `BLOCK`. Attaches complete explainability evidence. | **IMPLEMENTED (Base)** (Rule engine, gate checking, and explainability formatting active) |
-
----
-
-## 5. Decisions & Architectural Constraints
-
-1. **Deterministic Risk Engine**: The final `ALLOW` / `HOLD` / `BLOCK` decision is 100% deterministic code. An LLM must **NEVER** independently make the enforcement decision.
-2. **No Custom Chatbot / Agent**: MCPath is strictly a transparent security proxy. Claude Desktop (or other standard MCP host) remains the conversational agent.
-3. **Read-Only Observability Path**: The dashboard and FastAPI backend observe security events; they cannot intercept or control live proxy enforcement.
-4. **Preserve Official MCP SDK**: Always use standard `mcp` library protocols (`mcp.server.lowlevel`, `mcp.client.session.ClientSession`, stdio streams).
-5. **No Blind 0-100 Blended Scores**: All decisions must preserve Section 7 attributable explainability with clear per-stage evidence.
-6. **Fail-Closed Policy**: Database unavailability, unapproved tools, or missing hashes must trigger a hard block (`BLOCK`) rather than silently allowing execution.
-7. **Dynamic & Server-Agnostic**: Switching downstream servers via `config/server_config.json` automatically discovers tools and computes approved hashes without modifying pipeline code.
-
----
-
-## 6. Next Development & Roadmap
-
-- **Current Stage**: Real MCP server support complete. Ready for Day 3 development (Stage 2 Capability Graph).
-- **Immediate Next Tasks**:
-  1. **Stage 2 Capability Graph Builder (Days 5-6)**:
-     - Automatically parse tool parameters and descriptions to extract Resource, Action, and Destination nodes.
-     - Connect graph edges (`CAN_CALL`, `READS`, `WRITES`, `FLOWS_TO`, `SENDS_TO`).
-     - Calculate causal multi-hop path risk scores in NetworkX.
-  2. **Stage 3 Intent Verification (Days 7-8)**:
-     - Embed user prompts and tool actions to compute semantic similarity and detect indirect prompt injection.
-  3. **Stage 4 Behaviour Baseline & Anomaly Detection (Days 9-10)**:
-     - Implement statistical parameter tracking (length, schema deviation, call frequency).
-  4. **Stage 5 Response Inspector (Day 11)**:
-     - High-speed regex scanning for PII (SSN, credit cards, emails, private keys) on tool response text.
-  5. **Admin Dashboard & Live Event Stream (Days 12-13)**:
-     - Build dashboard UI to display live intercepted events, graph visualization, and stage breakdowns.
+7. **Trigger Dynamic Server Reload**:
+   ```powershell
+   Invoke-RestMethod -Method POST -Uri "http://127.0.0.1:8000/api/servers/reload"
+   ```
 
 ---
 
 ## 7. Recent Changes
 
-- **2026-09-22 (Registry Cleanup & Microsoft PostgreSQL MCP Integration)**:
-  - **Registry Cleanup**:
-    - Kept `sample_reference_server` strictly as a test/regression fixture; removed obsolete `sample-server` from tests, scripts, and database.
-    - Removed obsolete duplicate filesystem server (`filesystem_reference`) from PostgreSQL; maintained single canonical `filesystem` entry.
-    - Investigated and resolved the persistence issue where `command`/`args` fields for filesystem, git, and fetch were empty: `verify_real_servers.py` had omitted command/args from `register_trusted_server_and_tools()`, causing `database.py` defaults to overwrite existing entries with `python`/`[]`. Fixed `database.py` to preserve existing command/args when updating, and updated registration callers to pass explicit command/args/env definitions.
-    - Implemented `_sanitize_env_vars()` in `database.py` to redact sensitive credentials (passwords, tokens, keys, connection URIs) from stored environment variables in PostgreSQL tables.
-  - **Microsoft PostgreSQL MCP Integration (`postgres-mcp`)**:
-    - Replaced `fetch` with official `@microsoft/postgres-mcp` as the third real demo server.
-    - Preserved MCPath server-agnostic architecture without any PostgreSQL-specific modifications to Stages 1–6.
-    - Created an isolated `mcpath_demo_db` database and `mcpath_demo_user` role, with strict isolation preventing any access to MCPath's core database. Seeded demo tables (`demo_customers`, `demo_orders`).
-    - Configured `postgres-mcp` via `config/server_config.json` and `.env` using `${POSTGRES_MCP_CONNECTION_STRING}` with zero hardcoded credentials in the repository.
-    - Untracked `.env` from Git and added comprehensive exclusion rules to `.gitignore`.
-    - Executed trusted registration discovering 13 tools and storing approved baseline hashes in PostgreSQL.
-    - Confirmed tools are visible and directly suitable for Stage 2 capabilities:
-      - **READ**: `postgres_mcp_query`
-      - **WRITE/MODIFY**: `postgres_mcp_modify`
-      - **Schema Access**: `postgres_mcp_db_context`
-      - **Data Loading**: `postgres_mcp_bulk_load_csv`
-    - Updated `verify_real_servers.py` to test `postgres-mcp` (`postgres_mcp_list_connection_profiles` tool call) alongside `filesystem`, `git`, and regression suite.
-    - **Verification Result**: 100% pass across all real servers, Stage 1 live lifecycle, and all 22 automated unit/integration tests.
-
-
-- **2026-09-22 (Real MCP Server Support)**:
-  - Added `filesystem`, `git`, and `fetch` server entries to [`config/server_config.json`](file:///c:/projects/mcp%20proxy/config/server_config.json) using correct production commands.
-    - Filesystem: `cmd /c npx -y @modelcontextprotocol/server-filesystem ${FILESYSTEM_ALLOWED_PATHS}` (14 tools)
-    - Git: `uvx mcp-server-git --repository ${GIT_REPOSITORY_PATH}` (12 tools, no GitHub PAT)
-    - Fetch: `uvx mcp-server-fetch` (1 tool, no credentials)
-  - Added `FILESYSTEM_ALLOWED_PATHS` and `GIT_REPOSITORY_PATH` fields to `Settings` in [`settings.py`](file:///c:/projects/mcp%20proxy/mcpath/config/settings.py).
-  - Added `interpolate_server_config()` utility to resolve `${VAR}` placeholders in server args/env at runtime from `.env` values.
-  - Fixed `DownstreamClientManager` to merge full `os.environ` into subprocess env (required for Node/uvx on Windows to inherit PATH).
-  - Updated `passthrough.py` and `register.py` to call `interpolate_server_config` before spawning the subprocess.
-  - Created [`verify_real_servers.py`](file:///c:/projects/mcp%20proxy/verify_real_servers.py): full production verification (connect → tools/list → trusted registration → Stage 1 → tools/call) for all 3 real servers + regression check.
-  - **Verification result**: All 3 real servers + 22 existing tests pass (100%).
-- **2026-09-22 (Day 2.1 Milestone Completed)**:
-  - Created Trusted Registration CLI [`mcpath/register.py`](file:///c:/projects/mcp%20proxy/mcpath/register.py): `python -m mcpath.register --all` or `--server <name>`. Connects to each MCP server, calls `tools/list`, extracts `{name, description, inputSchema}`, canonicalizes, computes SHA-256, upserts idempotent approved baseline record in PostgreSQL.
-  - Enforced strict registration/runtime separation: `tools/list` interception in proxy only caches definitions for runtime lookup — it does NOT auto-create approved hashes. Approved hashes are ONLY created by the explicit registration CLI.
-  - Created 7-test integration suite [`tests/test_stage1_end_to_end.py`](file:///c:/projects/mcp%20proxy/tests/test_stage1_end_to_end.py): registration creates baseline; unchanged definition passes; description tampering blocks; schema tampering blocks; JSON key reordering passes; missing baseline fails-closed; re-registration is idempotent.
-  - Confirmed live end-to-end run `verify_stage1_e2e.py` against PostgreSQL 18.4 at `localhost:5432/MCPath` — 100% pass. 6 tools registered, hash-match PASS and rug-pull BLOCK both verified, security events audited in database.
-  - Total test count raised from 15 → **22 passing tests** (pytest exit 0).
-- **2026-09-21 (Day 2 Milestone Completed)**:
-  - Created 8 SQLAlchemy database models (`servers`, `tools`, `approved_hashes`, `capabilities`, `baseline_traces`, `security_events`, `stage_results`, `decisions`) with relational constraints, indexes, and foreign keys.
-  - Implemented async PostgreSQL database layer with `asyncpg` driver, connection lifecycle management, and repository methods.
-  - Implemented Stage 1 Tool Integrity Hash Check with recursive key sorting canonicalization, SHA-256 hashing, and PostgreSQL `approved_hashes` lookup.
-  - Added FastAPI persistence and inspection routes for `/api/hashes`, `/api/stage-results`, `/api/servers/{server_name}/tools`.
-  - Created `verify_day2.py` milestone verification script demonstrating live rug-pull detection, blocking, and database audit recording.
-- **2026-09-21 (Day 1 Milestone Completed)**:
-  - Implemented core proxy server with lowlevel MCP server and downstream client session manager.
-  - Added support for stdio JSON-RPC communication between Claude Desktop and downstream servers.
-  - Created reference mock server with `echo`, `calculate`, `read_customer`, `send_email`, `summarize_repository`, `delete_repository`.
-  - Built 6-stage pipeline architecture with base classes, context models, and pass-through runners.
-  - Verified end-to-end functionality with standalone `verify_milestone.py`.
-
----
-
-## 8. Known Issues & Real TODOs
-
-- [ ] **Stage 2-5 Concrete Logic**: Stages 2 through 5 are currently operating in skeleton pass-through mode until their respective milestone days.
-- [ ] **Alembic Migration Setup**: Schema currently initializes via SQLAlchemy `Base.metadata.create_all`; Alembic configuration can be added as schema grows.
+- **2026-09-22 (Multi-Server Architecture Refactoring — 1 Claude Connector to Multiple Downstream MCP Servers)**:
+  - **Single Claude Connector**: Updated `mcpath/proxy/run.py` and `mcpath/proxy/passthrough.py` so Claude Desktop connects via a single stdio connection to `run_proxy.py` without requiring server flags.
+  - **Multi-Server Downstream Manager (`DownstreamClientManager`)**:
+    - Replaced single-server management with concurrent multi-server session management using independent `AsyncExitStack` transports.
+    - Added independent lifecycle management: failures in one downstream server do not affect others; failed servers are recorded in `unavailable_servers` and excluded from `tools/list`.
+    - Added deterministic tool collision resolution: colliding tool names across servers are prefixed with `{server_name}_{tool_name}`; unique tool names remain unchanged.
+    - Maintained exact exposed tool routing: `exposed_name -> (server_name, original_tool_name, raw_definition)`. Calls are routed to the owning server's `ClientSession` using `original_tool_name`. Tool calls on Server A can never reach Server B.
+  - **Two-Phase Risk Engine Timing**:
+    - Refactored `PipelineRunner` to execute in two explicit phases of the deterministic Risk Engine: Phase 1 Pre-Execution (Stages 1–4 -> Risk Engine decision) and Phase 2 Post-Execution (Stage 5 Response Risk -> Risk Engine final decision).
+    - Hard blocks in Stage 1 immediately stop downstream execution and record Stages 2–5 as `NOT_EXECUTED` (status `SKIPPED`, `passed=False`).
+  - **Dynamic Server Reloading**:
+    - Added `reload()` method to `DownstreamClientManager` to detect added/removed servers, reconnect, rediscover tools, and update exposed mappings.
+    - Added `POST /api/servers/reload` route in `mcpath/backend/routes/servers.py`.
+    - Added `rebuild_for_all_servers()` and `remove_server()` to `CapabilityGraph` to dynamically represent configured servers.
+  - **Discovery vs Approval Separation**: Verified that server reload and discovery do not create approved hashes in PostgreSQL. Unapproved tools fail-closed with `NO_APPROVED_BASELINE`.
+  - **Comprehensive Test Suite & Verification**:
+    - Created `tests/test_multi_server_proxy.py` covering multi-server startup, aggregated tool listing, collision namespacing, cross-server routing isolation, Stage 1 mismatch blocking, missing baseline fail-closed policy, independent server failure handling, and dynamic reload.
+    - Total test suite raised to **28 passing automated tests** (100% pass).
+    - Updated `verify_real_servers.py` to test one MCPath process connecting concurrently to Filesystem (`C:\projects\mcp-demos\filesystem`), Git (`C:\projects\mcp-demos\GitRepo`), and PostgreSQL (`mcpath_demo_db`). Verified 39 tools exposed, routed execution across all 3 servers, and passed the controlled Claude Desktop rug-pull simulation.
+- **2026-09-22 (Bug Fix: Trusted Registration CLI & Single-Server Positional Argument Handling)**:
+  - **Root Cause**: `DownstreamClientManager.__init__` accepted `server_defs` as its first parameter. Callers passing `DownstreamClientManager(server_def, server_name=...)` with positional `ServerDefinition` caused Python to assign the Pydantic `ServerDefinition` object to `server_defs`. `dict(server_def)` iterated over the model's field names (`command`, `args`, `env`), attempting to treat string values as `ServerDefinition` objects (`'str' object has no attribute 'command'`).
+  - **Fix**:
+    - Updated `DownstreamClientManager.__init__` to check `isinstance(server_defs, ServerDefinition)` and properly route it to `server_def`.
+    - Explicitly passed `server_def=server_def, server_name=server_name` keyword arguments in `mcpath/register.py`.
+    - Added automated regression test `test_register_server_by_name_and_manager_instantiation` in `tests/test_multi_server_proxy.py` (total test suite raised to **29 passing automated tests**).
+    - Executed live registration across all configured servers: 45 total tools registered in PostgreSQL (6 sample, 14 filesystem, 12 git, 13 postgres-mcp).
