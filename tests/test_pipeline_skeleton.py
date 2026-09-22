@@ -3,7 +3,7 @@
 import pytest
 from mcpath.pipeline.pipeline_runner import PipelineRunner
 from mcpath.pipeline.stage import PipelineContext
-from mcpath.pipeline.stages.stage1_hash import compute_tool_hash, canonicalize_tool_definition
+from mcpath.pipeline.stages.stage1_hash import compute_tool_hash, canonicalize_tool_definition, Stage1HashCheck
 from mcpath.risk_engine.engine import RiskEngine
 from mcpath.risk_engine.models import EnforcementDecision, RiskScores, SecurityEventRecord
 from mcpath.risk_engine.explainability import format_explanation
@@ -23,8 +23,16 @@ def test_canonicalize_and_hash():
 
 @pytest.mark.asyncio
 async def test_pipeline_runner_passthrough():
-    """Verify Day 1 pipeline runner processes context and allows valid calls."""
-    runner = PipelineRunner()
+    """Verify pipeline runner processes context and allows valid calls when hash matches."""
+    tool_def = {"name": "echo", "description": "Echo message", "inputSchema": {"type": "object"}}
+    approved_sha = compute_tool_hash(tool_def)
+
+    async def mock_hash_provider(server_name, tool_name):
+        return approved_sha
+
+    stage1 = Stage1HashCheck(hash_provider=mock_hash_provider)
+    runner = PipelineRunner(stage1=stage1, persist_events=False)
+
     event = SecurityEventRecord(
         timestamp="2026-09-17T12:00:00Z",
         server_name="test-server",
@@ -35,6 +43,7 @@ async def test_pipeline_runner_passthrough():
         server_name="test-server",
         tool_name="echo",
         arguments={"message": "hello"},
+        tool_definition=tool_def,
         event_record=event
     )
 

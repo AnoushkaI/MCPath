@@ -13,8 +13,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from mcpath.backend.persistence.database import init_db
 from mcpath.backend.routes.events import router as events_router
+from mcpath.backend.routes.hashes import router as hashes_router
 from mcpath.backend.routes.overview import router as overview_router
 from mcpath.backend.routes.servers import router as servers_router
+from mcpath.backend.routes.stage_results import router as stage_results_router
 
 logger = logging.getLogger("mcpath.backend")
 
@@ -51,6 +53,8 @@ app.add_middleware(
 # Include routes
 app.include_router(overview_router)
 app.include_router(events_router)
+app.include_router(hashes_router)
+app.include_router(stage_results_router)
 app.include_router(servers_router)
 
 
