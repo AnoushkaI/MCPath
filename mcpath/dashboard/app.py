@@ -38,7 +38,40 @@ def main():
 
     with tabs[2]:
         st.subheader("Dynamic Capability Graph")
-        st.info("Causal capability graph: Agent -> Tool -> Resource -> Action -> Destination.")
+        try:
+            import requests
+            resp = requests.get("http://127.0.0.1:8000/api/capabilities/graph", timeout=2)
+            if resp.status_code == 200:
+                gdata = resp.json()
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Graph Nodes", gdata.get("total_nodes", 0))
+                c2.metric("Typed Edges", gdata.get("total_edges", 0))
+                c3.metric("Policy Version", gdata.get("policy_version", "1.0.0"))
+
+                paths_resp = requests.get("http://127.0.0.1:8000/api/capabilities/paths", timeout=2)
+                if paths_resp.status_code == 200:
+                    paths = paths_resp.json()
+                    c4.metric("Compatible Paths", len(paths))
+                    st.write("### Compatible Paths & Path Scores")
+                    for p in paths:
+                        path_str = " ➔ ".join(p.get("path_nodes", []))
+                        score = p.get("path_risk_score", 0.0)
+                        sev = p.get("classification", "LOW")
+                        override = " 🚨 CRITICAL OVERRIDE" if p.get("is_critical_override") else ""
+                        with st.expander(f"[{sev}] {path_str} (Score: {score:.1f}){override}"):
+                            st.write(f"**Explanation:** {p.get('explanation')}")
+                            st.write(
+                                f"Data Sens: {p.get('data_sensitivity')} | "
+                                f"Action Sens: {p.get('action_sensitivity')} | "
+                                f"Ext Exposure: {p.get('external_exposure')} | "
+                                f"Chain Risk: {p.get('chain_risk')}"
+                            )
+                else:
+                    st.info("No paths available yet from backend API.")
+            else:
+                st.info("Causal capability graph: Agent -> Tool -> Resource -> Action -> Destination. (Backend API offline)")
+        except Exception:
+            st.info("Causal capability graph: Agent -> Tool -> Resource -> Action -> Destination.")
 
     with tabs[3]:
         st.subheader("Risk Analysis")

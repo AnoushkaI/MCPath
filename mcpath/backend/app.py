@@ -17,6 +17,7 @@ from mcpath.backend.routes.hashes import router as hashes_router
 from mcpath.backend.routes.overview import router as overview_router
 from mcpath.backend.routes.servers import router as servers_router
 from mcpath.backend.routes.stage_results import router as stage_results_router
+from mcpath.backend.routes.capabilities import router as capabilities_router
 
 logger = logging.getLogger("mcpath.backend")
 
@@ -56,6 +57,7 @@ app.include_router(events_router)
 app.include_router(hashes_router)
 app.include_router(stage_results_router)
 app.include_router(servers_router)
+app.include_router(capabilities_router)
 
 
 @app.get("/health")

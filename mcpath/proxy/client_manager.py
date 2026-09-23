@@ -315,6 +315,16 @@ class DownstreamClientManager:
 
         self.exposed_tools = new_exposed
         self.capability_graph.rebuild_for_all_servers(graph_tools)
+        try:
+            import asyncio
+            from mcpath.backend.persistence.database import persist_capability_graph
+            loop = asyncio.get_running_loop()
+            if loop.is_running():
+                exported = self.capability_graph.export_graph()
+                loop.create_task(persist_capability_graph(exported))
+        except (RuntimeError, Exception) as e:
+            logger.debug("Capability graph persistence deferred or skipped: %s", e)
+
         logger.info(
             "Aggregated catalog updated: %d tools exposed across %d connected servers (%d unavailable)",
             len(self.exposed_tools),

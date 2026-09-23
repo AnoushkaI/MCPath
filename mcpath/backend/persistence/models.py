@@ -92,20 +92,74 @@ class ApprovedHashDB(Base):
 
 
 class CapabilityDB(Base):
-    """Stage 2 Capability Graph node / action mapping (placeholder for Day 5)."""
+    """Stage 2 Capability Graph node / action mapping."""
     __tablename__ = "capabilities"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    tool_id = Column(Integer, ForeignKey("tools.id", ondelete="CASCADE"), nullable=False, index=True)
+    tool_id = Column(Integer, ForeignKey("tools.id", ondelete="CASCADE"), nullable=True, index=True)
     tool_name = Column(String(100), nullable=False, index=True)
+    server_name = Column(String(100), nullable=True, index=True)
     resource_type = Column(String(100), nullable=True)
     action = Column(String(100), nullable=True)
+    operation = Column(String(20), nullable=True)
     destination = Column(String(100), nullable=True)
+    data_sensitivity = Column(Float, default=0.0, nullable=False)
+    action_sensitivity = Column(Float, default=0.0, nullable=False)
+    external_exposure = Column(Float, default=0.0, nullable=False)
     risk_weight = Column(Float, default=0.0, nullable=False)
+    policy_version = Column(String(50), default="1.0.0", nullable=False)
+    metadata_json = Column(JSON, default=dict, nullable=False)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
 
     # Relationships
     tool = relationship("ToolDB", back_populates="capabilities")
+
+
+class CapabilityNodeDB(Base):
+    """Dynamic capability graph nodes persisted in PostgreSQL."""
+    __tablename__ = "capability_nodes"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    node_id = Column(String(150), unique=True, nullable=False, index=True)
+    node_type = Column(String(50), nullable=False, index=True)
+    label = Column(String(150), nullable=False)
+    server_name = Column(String(100), nullable=True, index=True)
+    attributes_json = Column(JSON, default=dict, nullable=False)
+    policy_version = Column(String(50), default="1.0.0", nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+
+
+class CapabilityEdgeDB(Base):
+    """Dynamic capability graph typed edges persisted in PostgreSQL."""
+    __tablename__ = "capability_edges"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    source_node = Column(String(150), nullable=False, index=True)
+    target_node = Column(String(150), nullable=False, index=True)
+    relation = Column(String(50), nullable=False, index=True)
+    attributes_json = Column(JSON, default=dict, nullable=False)
+    policy_version = Column(String(50), default="1.0.0", nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+
+
+class CapabilityPathDB(Base):
+    """Enumerated compatible capability paths and scores persisted in PostgreSQL."""
+    __tablename__ = "capability_paths"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tool_name = Column(String(100), nullable=False, index=True)
+    path_nodes = Column(JSON, nullable=False)
+    path_edges = Column(JSON, nullable=False)
+    data_sensitivity = Column(Float, nullable=False)
+    action_sensitivity = Column(Float, nullable=False)
+    external_exposure = Column(Float, nullable=False)
+    chain_risk = Column(Float, nullable=False)
+    path_risk_score = Column(Float, nullable=False)
+    classification = Column(String(20), nullable=False, index=True)
+    is_critical_override = Column(Boolean, default=False, nullable=False)
+    explanation = Column(Text, nullable=True)
+    policy_version = Column(String(50), default="1.0.0", nullable=False)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
 
 
 class BaselineTraceDB(Base):

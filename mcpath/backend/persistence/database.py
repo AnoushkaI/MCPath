@@ -12,6 +12,9 @@ from mcpath.backend.persistence.models import (
     Base,
     BaselineTraceDB,
     CapabilityDB,
+    CapabilityNodeDB,
+    CapabilityEdgeDB,
+    CapabilityPathDB,
     DecisionDB,
     SecurityEventDB,
     ServerDB,
@@ -408,3 +411,177 @@ async def persist_security_event(
 
 # Backwards compatibility alias
 sync_discovered_tools = register_trusted_server_and_tools
+
+
+# =========================================================================
+# Capability Graph & Path Persistence Functions (Stage 2)
+# =========================================================================
+
+async def persist_capability_graph(
+    graph_data: Dict[str, Any],
+    session: Optional[AsyncSession] = None
+) -> None:
+    """Persist graph nodes, typed edges, and compatible paths into PostgreSQL."""
+    async def _op(s: AsyncSession):
+        policy_ver = graph_data.get("policy_version", "1.0.0")
+
+        # 1. Clear existing nodes, edges, paths for clean refresh
+        await s.execute(text("DELETE FROM capability_paths"))
+        await s.execute(text("DELETE FROM capability_edges"))
+        await s.execute(text("DELETE FROM capability_nodes"))
+
+        # 2. Insert nodes
+        for node in graph_data.get("nodes", []):
+            node_rec = CapabilityNodeDB(
+                node_id=node.get("id", ""),
+                node_type=node.get("type", "Unknown"),
+                label=node.get("label", node.get("id", "")),
+                server_name=node.get("server"),
+                attributes_json={k: v for k, v in node.items() if k not in ("id", "type", "label", "server")},
+                policy_version=policy_ver,
+                updated_at=datetime.now(timezone.utc)
+            )
+            s.add(node_rec)
+
+        # 3. Insert edges
+        for edge in graph_data.get("edges", []):
+            edge_rec = CapabilityEdgeDB(
+                source_node=edge.get("source", ""),
+                target_node=edge.get("target", ""),
+                relation=edge.get("relation", "CONNECTED"),
+                attributes_json={k: v for k, v in edge.items() if k not in ("source", "target", "relation")},
+                policy_version=policy_ver,
+                updated_at=datetime.now(timezone.utc)
+            )
+            s.add(edge_rec)
+
+        # 4. Insert paths
+        for path in graph_data.get("paths", []):
+            tool_name = "unknown"
+            path_nodes = path.get("path_nodes", [])
+            for n in path_nodes:
+                if n.startswith("Tool:"):
+                    tool_name = n.split("Tool:", 1)[1]
+                    break
+
+            path_rec = CapabilityPathDB(
+                tool_name=tool_name,
+                path_nodes=path_nodes,
+                path_edges=path.get("path_edges", []),
+                data_sensitivity=float(path.get("data_sensitivity", 0.0)),
+                action_sensitivity=float(path.get("action_sensitivity", 0.0)),
+                external_exposure=float(path.get("external_exposure", 0.0)),
+                chain_risk=float(path.get("chain_risk", 0.0)),
+                path_risk_score=float(path.get("path_risk_score", 0.0)),
+                classification=path.get("classification", "LOW"),
+                is_critical_override=bool(path.get("is_critical_override", False)),
+                explanation=path.get("explanation", ""),
+                policy_version=policy_ver,
+                created_at=datetime.now(timezone.utc)
+            )
+            s.add(path_rec)
+
+        await s.commit()
+
+    return await _run_with_retry(_op, session=session)
+
+
+async def persist_tool_capabilities(
+    capabilities: List[Dict[str, Any]],
+    session: Optional[AsyncSession] = None
+) -> None:
+    """Persist classified tool capabilities into capabilities table."""
+    async def _op(s: AsyncSession):
+        for cap in capabilities:
+            tool_name = cap.get("tool_name", "")
+            # Look up tool_id if exists
+            stmt = select(ToolDB.id).where(ToolDB.name == tool_name)
+            res = await s.execute(stmt)
+            tool_id = res.scalar_one_or_none()
+
+            cap_rec = CapabilityDB(
+                tool_id=tool_id,
+                tool_name=tool_name,
+                server_name=cap.get("server_name"),
+                resource_type=cap.get("data_target"),
+                action=cap.get("action_type"),
+                operation=cap.get("operation"),
+                destination=cap.get("external_destination"),
+                data_sensitivity=float(cap.get("data_sensitivity", 0.0)),
+                action_sensitivity=float(cap.get("action_sensitivity", 0.0)),
+                external_exposure=float(cap.get("external_exposure", 0.0)),
+                risk_weight=float(cap.get("action_sensitivity", 0.0)),
+                policy_version=cap.get("policy_version", "1.0.0"),
+                metadata_json=cap.get("raw_metadata", {}),
+                created_at=datetime.now(timezone.utc)
+            )
+            s.add(cap_rec)
+        await s.commit()
+
+    return await _run_with_retry(_op, session=session)
+
+
+async def get_persisted_capability_graph(session: Optional[AsyncSession] = None) -> Dict[str, Any]:
+    """Retrieve persisted capability graph nodes and edges from PostgreSQL."""
+    async def _op(s: AsyncSession) -> Dict[str, Any]:
+        stmt_nodes = select(CapabilityNodeDB)
+        res_nodes = await s.execute(stmt_nodes)
+        nodes = [
+            {
+                "id": n.node_id,
+                "type": n.node_type,
+                "label": n.label,
+                "server": n.server_name,
+                **n.attributes_json
+            }
+            for n in res_nodes.scalars().all()
+        ]
+
+        stmt_edges = select(CapabilityEdgeDB)
+        res_edges = await s.execute(stmt_edges)
+        edges = [
+            {
+                "source": e.source_node,
+                "target": e.target_node,
+                "relation": e.relation,
+                **e.attributes_json
+            }
+            for e in res_edges.scalars().all()
+        ]
+
+        return {"nodes": nodes, "edges": edges}
+
+    return await _run_with_retry(_op, session=session)
+
+
+async def get_persisted_capability_paths(
+    tool_name: Optional[str] = None,
+    session: Optional[AsyncSession] = None
+) -> List[Dict[str, Any]]:
+    """Retrieve persisted compatible paths from PostgreSQL."""
+    async def _op(s: AsyncSession) -> List[Dict[str, Any]]:
+        stmt = select(CapabilityPathDB).order_by(CapabilityPathDB.path_risk_score.desc())
+        if tool_name:
+            stmt = stmt.where(CapabilityPathDB.tool_name == tool_name)
+        res = await s.execute(stmt)
+        return [
+            {
+                "id": p.id,
+                "tool_name": p.tool_name,
+                "path_nodes": p.path_nodes,
+                "path_edges": p.path_edges,
+                "data_sensitivity": p.data_sensitivity,
+                "action_sensitivity": p.action_sensitivity,
+                "external_exposure": p.external_exposure,
+                "chain_risk": p.chain_risk,
+                "path_risk_score": p.path_risk_score,
+                "classification": p.classification,
+                "is_critical_override": p.is_critical_override,
+                "explanation": p.explanation,
+                "policy_version": p.policy_version,
+                "created_at": p.created_at.isoformat() if p.created_at else None
+            }
+            for p in res.scalars().all()
+        ]
+
+    return await _run_with_retry(_op, session=session)

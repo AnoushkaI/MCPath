@@ -343,8 +343,8 @@ async def test_dynamic_server_reload_and_graph_update():
 
     # Verify capability graph updated with new server's tools
     graph_nodes = list(mgr.capability_graph.graph.nodes)
-    assert "echo" in graph_nodes
-    assert "calculate" in graph_nodes
+    assert "Tool:echo" in graph_nodes
+    assert "Tool:calculate" in graph_nodes
 
     # Dynamically remove server
     empty_config = ServerConfig(active_servers=[], servers={})
@@ -354,7 +354,7 @@ async def test_dynamic_server_reload_and_graph_update():
     assert len(mgr.exposed_tools) == 0
 
     # Verify capability graph cleared tools
-    assert "echo" not in mgr.capability_graph.graph.nodes
+    assert "Tool:echo" not in mgr.capability_graph.graph.nodes
 
     await mgr.stop_all_servers()
 

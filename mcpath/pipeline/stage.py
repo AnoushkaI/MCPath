@@ -14,6 +14,7 @@ class PipelineContext(BaseModel):
     user_prompt: Optional[str] = None
     tool_definition: Optional[Dict[str, Any]] = None
     tool_response: Optional[Any] = None
+    call_history: list[str] = Field(default_factory=list)
     event_record: SecurityEventRecord
 
 

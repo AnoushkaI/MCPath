@@ -28,6 +28,10 @@ def create_proxy_server(
 ) -> Server:
     """Create configured MCP Server instance that routes through the security pipeline."""
     runner = pipeline_runner or PipelineRunner()
+    if hasattr(runner, "stage2") and hasattr(runner.stage2, "graph"):
+        runner.stage2.graph = client_manager.capability_graph
+
+    call_history: List[str] = []
 
     # Backward compatibility with tests passing downstream_session directly
     if downstream_session is not None:
@@ -97,11 +101,13 @@ def create_proxy_server(
             arguments=arguments,
         )
 
+        call_history.append(original_name)
         pipeline_ctx = PipelineContext(
             server_name=owning_server,
             tool_name=original_name,
             arguments=arguments,
             tool_definition=tool_def,
+            call_history=list(call_history),
             event_record=event
         )
 

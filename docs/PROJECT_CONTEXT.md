@@ -192,7 +192,7 @@ The pipeline evaluates every intercepted call in two deterministic phases:
 | Stage | Name | Role & Question Answered | Status |
 |---|---|---|---|
 | **Stage 1** | **Tool Integrity Hash Check** | *"Has this tool's definition changed since it was approved?"* Computes SHA-256 over canonicalized JSON and compares against PostgreSQL `approved_hashes`. Mismatches trigger immediate hard block without evaluating later stages (stops tool rug pulls). Fail-closed on missing baseline/DB error. | **IMPLEMENTED** |
-| **Stage 2** | **Capability Risk** | *"Can this tool access sensitive resources or chain to external exfiltration?"* Analyzes graph paths in NetworkX (Agent $\rightarrow$ Tool $\rightarrow$ Resource $\rightarrow$ Action $\rightarrow$ Destination) to produce risk score $[0, 100]$. Dynamically represents all configured servers. | **SKELETON / READY FOR EXPANSION** |
+| **Stage 2** | **Capability Risk** | *"Can this tool access sensitive resources or chain to external exfiltration?"* Analyzes graph paths in NetworkX (Agent $\rightarrow$ Tool $\rightarrow$ Resource $\rightarrow$ Action $\rightarrow$ Destination) to produce risk score $[0, 100]$. Deterministic policy file (`config/capability_policy.json`), transition-based chain risk, critical override for sensitive $\rightarrow$ external paths, fail-safe unknown path elevated scoring. | **IMPLEMENTED** |
 | **Stage 3** | **Intent Verification** | *"Does the requested tool call align with the user's explicit prompt?"* Compares embeddings of user prompt vs tool call semantics to detect prompt injection/jailbreak manipulation. | **SKELETON / READY FOR EXPANSION** |
 | **Stage 4** | **Behaviour Deviation** | *"Is this call anomalous compared to historical baseline traces?"* Checks parameter sizes, invocation frequencies, and argument shapes against historical statistical baselines. | **SKELETON / READY FOR EXPANSION** |
 | **Stage 5** | **Response Risk Inspection** | *"Does the downstream server output leak sensitive data (PII, API keys, credentials)?"* Inspects tool outputs using fast regex heuristics and optional secondary bounded classifier. | **SKELETON / READY FOR EXPANSION** |
@@ -254,10 +254,15 @@ The pipeline evaluates every intercepted call in two deterministic phases:
     - Created `tests/test_multi_server_proxy.py` covering multi-server startup, aggregated tool listing, collision namespacing, cross-server routing isolation, Stage 1 mismatch blocking, missing baseline fail-closed policy, independent server failure handling, and dynamic reload.
     - Total test suite raised to **28 passing automated tests** (100% pass).
     - Updated `verify_real_servers.py` to test one MCPath process connecting concurrently to Filesystem (`C:\projects\mcp-demos\filesystem`), Git (`C:\projects\mcp-demos\GitRepo`), and PostgreSQL (`mcpath_demo_db`). Verified 39 tools exposed, routed execution across all 3 servers, and passed the controlled Claude Desktop rug-pull simulation.
-- **2026-09-22 (Bug Fix: Trusted Registration CLI & Single-Server Positional Argument Handling)**:
-  - **Root Cause**: `DownstreamClientManager.__init__` accepted `server_defs` as its first parameter. Callers passing `DownstreamClientManager(server_def, server_name=...)` with positional `ServerDefinition` caused Python to assign the Pydantic `ServerDefinition` object to `server_defs`. `dict(server_def)` iterated over the model's field names (`command`, `args`, `env`), attempting to treat string values as `ServerDefinition` objects (`'str' object has no attribute 'command'`).
-  - **Fix**:
-    - Updated `DownstreamClientManager.__init__` to check `isinstance(server_defs, ServerDefinition)` and properly route it to `server_def`.
-    - Explicitly passed `server_def=server_def, server_name=server_name` keyword arguments in `mcpath/register.py`.
-    - Added automated regression test `test_register_server_by_name_and_manager_instantiation` in `tests/test_multi_server_proxy.py` (total test suite raised to **29 passing automated tests**).
-    - Executed live registration across all configured servers: 45 total tools registered in PostgreSQL (6 sample, 14 filesystem, 12 git, 13 postgres-mcp).
+- **2026-09-23 (Day 3: Capability Risk Graph + Path Scoring)**:
+  - **Deterministic Policy Separation**: Added `config/capability_policy.json` (policy v1.0.0) containing classification rules, transition-based chain risk definitions, path scoring weights (Data: 0.30, Action: 0.25, Exposure: 0.20, Chain: 0.25), configurable critical path override thresholds, and fail-safe unknown path configuration.
+  - **Capability Inference Engine**: Implemented `CapabilityClassifier` deriving metadata strictly from manifest definitions without inventing unsupported capabilities; verified by negative tests.
+  - **Dynamic NetworkX Causal Graph**: Implemented `CapabilityGraph` with typed nodes (`Agent`, `Tool`, `Data/Resource`, `Action`, `External Destination`) and typed edges (`CAN_CALL`, `READS`, `WRITES`, `FLOWS_TO`, `SENDS_TO`). Sinks enforce strict path completion.
+  - **Transition-Based Chain Risk**: Computed chain risk based on security transition significance rather than raw graph length.
+  - **Configurable Critical Path Override**: If sensitive data flows to external action and destination, classifies as `HIGH` independently of weighted score.
+  - **Runtime Sequence Mapping & Fail-Closed Unknowns**: Maps active calls and call sequences against graph paths; reports `"CAPABILITY PATH: UNKNOWN / UNMODELED"` with elevated score (75.0) when no compatible path is found.
+  - **Dynamic Server Reload**: Automatically rebuilds capability graph and recomputes paths when servers are added, changed, or removed.
+  - **PostgreSQL Persistence & Observability**: Added `capability_nodes`, `capability_edges`, `capability_paths`, and enhanced `capabilities` tables with FastAPI routes (`/api/capabilities/policy`, `/api/capabilities/graph`, `/api/capabilities/paths`, `/api/capabilities/tools`) and Streamlit dashboard integration.
+  - **Empirical Evaluation Benchmark**: Evaluated policy-v1 against a 30-path benchmark dataset (15 dangerous, 15 benign), reporting precision, recall, F1, FPR, and FNR.
+  - **Comprehensive Verification**: Added `tests/test_capability_graph.py` (12 tests); full test suite elevated to **41 passing automated tests** (100% pass).
+
