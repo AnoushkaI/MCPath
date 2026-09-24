@@ -1,0 +1,34 @@
+{
+  "policy_version": "1.0.0",
+  "name": "Deterministic Semantic Intent Risk Policy v1",
+  "description": "Cosine similarity embedding thresholds and risk conversion formula for MCPath Stage 3 Intent Risk.",
+  "model_name": "all-MiniLM-L6-v2",
+  "thresholds": {
+    "acceptable_similarity_threshold": 0.70,
+    "low_risk_similarity": 0.70,
+    "borderline_similarity": 0.45,
+    "high_risk_similarity": 0.30
+  },
+  "scoring": {
+    "formula": "linear_inverted",
+    "min_score": 0.0,
+    "max_score": 100.0,
+    "similarity_floor": 0.0,
+    "similarity_ceiling": 1.0
+  },
+  "levels": {
+    "low": {
+      "max_score": 30.0,
+      "label": "LOW"
+    },
+    "medium": {
+      "min_score": 30.0,
+      "max_score": 70.0,
+      "label": "MEDIUM"
+    },
+    "high": {
+      "min_score": 70.0,
+      "label": "HIGH"
+    }
+  }
+}

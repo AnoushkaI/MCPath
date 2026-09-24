@@ -67,6 +67,7 @@ class Settings(BaseSettings):
     proxy_control_port: int = Field(default=8765, alias="PROXY_CONTROL_PORT")
 
     # Pipeline Thresholds
+    intent_policy_path: str = Field(default="config/intent_policy.json", alias="MCPATH_INTENT_POLICY")
     intent_similarity_threshold: float = Field(default=0.70, alias="INTENT_SIMILARITY_THRESHOLD")
     behaviour_deviation_threshold: float = Field(default=0.60, alias="BEHAVIOUR_DEVIATION_THRESHOLD")
     response_risk_threshold: float = Field(default=0.65, alias="RESPONSE_RISK_THRESHOLD")

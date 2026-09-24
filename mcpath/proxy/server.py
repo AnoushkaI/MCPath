@@ -94,11 +94,18 @@ def create_proxy_server(
             original_name
         )
 
+        user_prompt = None
+        if hasattr(params, "meta") and params.meta:
+            user_prompt = params.meta.get("user_prompt") or params.meta.get("prompt")
+        if not user_prompt and isinstance(arguments, dict):
+            user_prompt = arguments.get("_user_prompt") or arguments.get("user_prompt")
+
         event = SecurityEventRecord(
             timestamp=timestamp,
             server_name=owning_server,
             tool_name=original_name,
             arguments=arguments,
+            user_prompt=user_prompt,
         )
 
         call_history.append(original_name)
@@ -106,6 +113,7 @@ def create_proxy_server(
             server_name=owning_server,
             tool_name=original_name,
             arguments=arguments,
+            user_prompt=user_prompt,
             tool_definition=tool_def,
             call_history=list(call_history),
             event_record=event

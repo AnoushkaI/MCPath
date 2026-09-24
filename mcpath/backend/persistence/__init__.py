@@ -13,6 +13,7 @@ from mcpath.backend.persistence.models import (
     SecurityEventDB,
     StageResultDB,
     DecisionDB,
+    IntentEvaluationDB,
 )
 from mcpath.backend.persistence.database import (
     get_db,
@@ -22,6 +23,7 @@ from mcpath.backend.persistence.database import (
     register_trusted_server_and_tools,
     get_approved_hash,
     persist_security_event,
+    get_intent_evaluation,
     set_server_active_state,
     reconcile_server_active_states,
     get_server_db_status,
@@ -44,6 +46,7 @@ __all__ = [
     "SecurityEventDB",
     "StageResultDB",
     "DecisionDB",
+    "IntentEvaluationDB",
     "get_db",
     "get_engine",
     "init_db",
@@ -51,6 +54,7 @@ __all__ = [
     "register_trusted_server_and_tools",
     "get_approved_hash",
     "persist_security_event",
+    "get_intent_evaluation",
     "set_server_active_state",
     "reconcile_server_active_states",
     "get_server_db_status",

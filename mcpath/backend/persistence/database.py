@@ -16,6 +16,7 @@ from mcpath.backend.persistence.models import (
     CapabilityEdgeDB,
     CapabilityPathDB,
     DecisionDB,
+    IntentEvaluationDB,
     SecurityEventDB,
     ServerDB,
     StageResultDB,
@@ -663,6 +664,7 @@ async def persist_security_event(
         await s.flush()
 
         # Add granular stage results if provided
+        has_stage3 = False
         if stage_results:
             for sr in stage_results:
                 stage_rec = StageResultDB(
@@ -677,6 +679,41 @@ async def persist_security_event(
                 )
                 s.add(stage_rec)
 
+                # Persist dedicated IntentEvaluationDB if this is Stage 3
+                if sr.get("stage_number") == 3 or sr.get("stage_name") == "Stage 3 - Intent Risk":
+                    has_stage3 = True
+                    meta = sr.get("metadata", {}) or {}
+                    intent_eval = IntentEvaluationDB(
+                        event_id=event_id,
+                        user_request=meta.get("user_request", event_dict.get("user_prompt")),
+                        tool_action=meta.get("tool_action", f"{tool_name}"),
+                        cosine_similarity=float(meta.get("cosine_similarity", 0.0)),
+                        intent_risk_score=float(sr.get("score") if sr.get("score") is not None else meta.get("intent_risk_score", 0.0)),
+                        similarity_threshold=float(meta.get("similarity_threshold", 0.70)),
+                        policy_version=str(meta.get("policy_version", "1.0.0")),
+                        classification=str(meta.get("classification", "LOW")),
+                        explanation=sr.get("explanation"),
+                        created_at=datetime.now(timezone.utc)
+                    )
+                    s.add(intent_eval)
+
+        # Fallback persistence for direct intent evaluation in event_dict if not already persisted from stage_results
+        if not has_stage3 and event_dict.get("intent_evaluation"):
+            ie_data = event_dict["intent_evaluation"]
+            intent_eval = IntentEvaluationDB(
+                event_id=event_id,
+                user_request=ie_data.get("user_request", event_dict.get("user_prompt")),
+                tool_action=ie_data.get("tool_action", f"{tool_name}"),
+                cosine_similarity=float(ie_data.get("cosine_similarity", 0.0)),
+                intent_risk_score=float(ie_data.get("intent_risk_score", int_risk or 0.0)),
+                similarity_threshold=float(ie_data.get("similarity_threshold", 0.70)),
+                policy_version=str(ie_data.get("policy_version", "1.0.0")),
+                classification=str(ie_data.get("classification", "LOW")),
+                explanation=ie_data.get("explanation"),
+                created_at=datetime.now(timezone.utc)
+            )
+            s.add(intent_eval)
+
         # Add decision record
         decision_rec = DecisionDB(
             event_id=event_id,
@@ -689,6 +726,36 @@ async def persist_security_event(
 
         await s.commit()
         return sec_event
+
+    return await _run_with_retry(_op, session=session)
+
+
+async def get_intent_evaluation(
+    event_id: str,
+    session: Optional[AsyncSession] = None
+) -> Optional[Dict[str, Any]]:
+    """Retrieve persisted Stage 3 Intent Risk evaluation for an event."""
+    async def _op(s: AsyncSession) -> Optional[Dict[str, Any]]:
+        stmt = select(IntentEvaluationDB).where(IntentEvaluationDB.event_id == event_id)
+        res = await s.execute(stmt)
+        rows = list(res.scalars().all())
+        res.close()
+        if not rows:
+            return None
+        ev = rows[0]
+        return {
+            "id": ev.id,
+            "event_id": ev.event_id,
+            "user_request": ev.user_request,
+            "tool_action": ev.tool_action,
+            "cosine_similarity": ev.cosine_similarity,
+            "intent_risk_score": ev.intent_risk_score,
+            "similarity_threshold": ev.similarity_threshold,
+            "policy_version": ev.policy_version,
+            "classification": ev.classification,
+            "explanation": ev.explanation,
+            "created_at": ev.created_at.isoformat() if ev.created_at else None
+        }
 
     return await _run_with_retry(_op, session=session)
 

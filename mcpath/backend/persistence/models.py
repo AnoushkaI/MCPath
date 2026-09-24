@@ -212,6 +212,7 @@ class SecurityEventDB(Base):
     # Relationships
     stage_results = relationship("StageResultDB", back_populates="security_event", cascade="all, delete-orphan")
     decision_record = relationship("DecisionDB", back_populates="security_event", uselist=False, cascade="all, delete-orphan")
+    intent_evaluation = relationship("IntentEvaluationDB", back_populates="security_event", uselist=False, cascade="all, delete-orphan")
 
 
 class StageResultDB(Base):
@@ -247,3 +248,23 @@ class DecisionDB(Base):
 
     # Relationships
     security_event = relationship("SecurityEventDB", back_populates="decision_record")
+
+
+class IntentEvaluationDB(Base):
+    """Stage 3 Semantic Intent Risk evaluation results persisted in PostgreSQL."""
+    __tablename__ = "intent_evaluations"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_id = Column(String(64), ForeignKey("security_events.event_id", ondelete="CASCADE"), nullable=False, index=True)
+    user_request = Column(Text, nullable=True)
+    tool_action = Column(Text, nullable=False)
+    cosine_similarity = Column(Float, nullable=False)
+    intent_risk_score = Column(Float, nullable=False)
+    similarity_threshold = Column(Float, nullable=False)
+    policy_version = Column(String(50), default="1.0.0", nullable=False)
+    classification = Column(String(20), default="LOW", nullable=False)
+    explanation = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+
+    # Relationships
+    security_event = relationship("SecurityEventDB", back_populates="intent_evaluation")
