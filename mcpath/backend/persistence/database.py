@@ -5,7 +5,7 @@ import json
 import logging
 import re
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple
-from sqlalchemy import select, update, text
+from sqlalchemy import select, update, text, func
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from mcpath.backend.persistence.models import (
     ApprovedHashDB,
@@ -39,13 +39,21 @@ def set_engine(custom_engine):
     """Set custom engine (used for testing or switching connection)."""
     global _engine, _async_session_factory, _tables_initialized
     _engine = custom_engine
-    _async_session_factory = async_sessionmaker(_engine, expire_on_commit=False, class_=AsyncSession)
+    if custom_engine is not None:
+        _async_session_factory = async_sessionmaker(_engine, expire_on_commit=False, class_=AsyncSession)
+    else:
+        _async_session_factory = None
     _tables_initialized = False
 
 
 def _create_engine_instance(db_url: str):
-    """Create engine instance."""
-    return create_async_engine(db_url, echo=False, pool_pre_ping=True)
+    """Create engine instance with appropriate timeout and pooling."""
+    kwargs: Dict[str, Any] = {"echo": False}
+    if "sqlite" in db_url:
+        kwargs["connect_args"] = {"timeout": 30.0}
+    else:
+        kwargs["pool_pre_ping"] = True
+    return create_async_engine(db_url, **kwargs)
 
 
 def get_engine():
@@ -77,9 +85,12 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
 async def _switch_to_fallback():
     """Switch global engine to SQLite fallback and create tables."""
     global _engine, _async_session_factory, _tables_initialized
+    if _engine is not None and getattr(_engine, "dialect", None) is not None and _engine.dialect.name == "sqlite":
+        logger.debug("Engine is already SQLite (%s); retaining existing engine.", _engine.url)
+        return
     fallback_url = settings.sqlite_fallback_url
     logger.warning("Switching database engine to fallback SQLite: %s", fallback_url)
-    _engine = create_async_engine(fallback_url, echo=False)
+    _engine = _create_engine_instance(fallback_url)
     _async_session_factory = async_sessionmaker(_engine, expire_on_commit=False, class_=AsyncSession)
     async with _engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -93,12 +104,44 @@ async def init_db(engine_instance=None) -> None:
     try:
         async with target_engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            if target_engine.dialect.name == "postgresql":
+                for col_stmt in [
+                    "ALTER TABLE capabilities ADD COLUMN IF NOT EXISTS server_name VARCHAR(100)",
+                    "ALTER TABLE capabilities ADD COLUMN IF NOT EXISTS operation VARCHAR(20)",
+                    "ALTER TABLE capabilities ADD COLUMN IF NOT EXISTS data_sensitivity FLOAT DEFAULT 0.0",
+                    "ALTER TABLE capabilities ADD COLUMN IF NOT EXISTS action_sensitivity FLOAT DEFAULT 0.0",
+                    "ALTER TABLE capabilities ADD COLUMN IF NOT EXISTS external_exposure FLOAT DEFAULT 0.0",
+                    "ALTER TABLE capabilities ADD COLUMN IF NOT EXISTS policy_version VARCHAR(50) DEFAULT '1.0.0'",
+                    "ALTER TABLE capabilities ADD COLUMN IF NOT EXISTS metadata_json JSON DEFAULT '{}'",
+                    "ALTER TABLE servers ADD COLUMN IF NOT EXISTS trust_status VARCHAR(20) DEFAULT 'UNTRUSTED'",
+                    "ALTER TABLE servers ADD COLUMN IF NOT EXISTS last_discovery_time TIMESTAMP WITH TIME ZONE",
+                    "ALTER TABLE servers ADD COLUMN IF NOT EXISTS last_trust_time TIMESTAMP WITH TIME ZONE"
+                ]:
+                    try:
+                        await conn.execute(text(col_stmt))
+                    except Exception:
+                        pass
+            else:
+                for col_stmt in [
+                    "ALTER TABLE servers ADD COLUMN trust_status VARCHAR(20) DEFAULT 'UNTRUSTED'",
+                    "ALTER TABLE servers ADD COLUMN last_discovery_time TIMESTAMP",
+                    "ALTER TABLE servers ADD COLUMN last_trust_time TIMESTAMP"
+                ]:
+                    try:
+                        await conn.execute(text(col_stmt))
+                    except Exception:
+                        pass
         _tables_initialized = True
         logger.info("Database schemas verified / created successfully.")
     except Exception as e:
         logger.warning("Primary database schema creation failed (%s). Falling back to SQLite fallback URL.", e)
         await _switch_to_fallback()
         logger.info("Fallback database schemas verified / created successfully on SQLite.")
+
+    try:
+        await reconcile_server_active_states()
+    except Exception as e:
+        logger.debug("Startup server active state reconciliation skipped: %s", e)
 
 
 async def _run_with_retry(operation: Callable[[AsyncSession], Any], session: Optional[AsyncSession] = None) -> Any:
@@ -114,13 +157,25 @@ async def _run_with_retry(operation: Callable[[AsyncSession], Any], session: Opt
             factory = get_session_factory()
 
         async with factory() as s:
-            return await operation(s)
+            res = await operation(s)
+            try:
+                if s.in_transaction():
+                    await s.rollback()
+            except Exception:
+                pass
+            return res
     except Exception as primary_exc:
         logger.warning("Primary database query failed (%s), attempting fallback...", primary_exc)
         await _switch_to_fallback()
         fallback_factory = get_session_factory()
         async with fallback_factory() as s:
-            return await operation(s)
+            res = await operation(s)
+            try:
+                if s.in_transaction():
+                    await s.rollback()
+            except Exception:
+                pass
+            return res
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
@@ -198,6 +253,7 @@ async def register_trusted_server_and_tools(
     args: Optional[List[str]] = None,
     env_vars: Optional[Dict[str, str]] = None,
     approved_by: str = "admin:trusted_registration",
+    is_active: Optional[bool] = None,
     session: Optional[AsyncSession] = None
 ) -> List[Tuple[ToolDB, ApprovedHashDB]]:
     """Register server, tools, and compute/store approved SHA-256 baseline hashes (Idempotent)."""
@@ -207,14 +263,19 @@ async def register_trusted_server_and_tools(
         # 1. Upsert server record
         stmt_srv = select(ServerDB).where(ServerDB.name == server_name)
         res_srv = await s.execute(stmt_srv)
-        server = res_srv.scalar_one_or_none()
+        servers = list(res_srv.scalars().all())
+        res_srv.close()
+        server = servers[0] if servers else None
+        now = datetime.now(timezone.utc)
         if server is None:
             server = ServerDB(
                 name=server_name,
                 command=command or "python",
                 args=args if args is not None else [],
                 env_vars=safe_env if safe_env is not None else {},
-                is_active=True
+                is_active=is_active if is_active is not None else True,
+                trust_status="TRUSTED",
+                last_trust_time=now
             )
             s.add(server)
             await s.flush()
@@ -225,7 +286,11 @@ async def register_trusted_server_and_tools(
                 server.args = args
             if safe_env is not None:
                 server.env_vars = safe_env
-            server.is_active = True
+            if is_active is not None:
+                server.is_active = is_active
+            # NOTE: Trusting must NOT alter is_active state unless explicitly specified
+            server.trust_status = "TRUSTED"
+            server.last_trust_time = now
             await s.flush()
 
         synced_records = []
@@ -242,7 +307,9 @@ async def register_trusted_server_and_tools(
             # 2. Upsert tool record
             stmt = select(ToolDB).where(ToolDB.server_id == server.id, ToolDB.name == tool_name)
             res = await s.execute(stmt)
-            tool = res.scalar_one_or_none()
+            tools_found = list(res.scalars().all())
+            res.close()
+            tool = tools_found[0] if tools_found else None
 
             if tool is None:
                 tool = ToolDB(
@@ -268,7 +335,8 @@ async def register_trusted_server_and_tools(
                 ApprovedHashDB.is_active == True
             )
             hash_res = await s.execute(hash_stmt)
-            active_hashes = hash_res.scalars().all()
+            active_hashes = list(hash_res.scalars().all())
+            hash_res.close()
 
             matched_existing = None
             for ah in active_hashes:
@@ -303,6 +371,221 @@ async def register_trusted_server_and_tools(
     return await _run_with_retry(_op, session=session)
 
 
+async def save_discovered_tools(
+    server_name: str,
+    tools: List[Dict[str, Any]],
+    command: Optional[str] = None,
+    args: Optional[List[str]] = None,
+    env_vars: Optional[Dict[str, str]] = None,
+    is_active: Optional[bool] = None,
+    session: Optional[AsyncSession] = None
+) -> List[ToolDB]:
+    """Upsert server and discovered tools WITHOUT creating approved hashes.
+
+    Preserves existing approved baseline and trust_status if already TRUSTED.
+    """
+    async def _op(s: AsyncSession):
+        safe_env = _sanitize_env_vars(env_vars) if env_vars is not None else None
+
+        stmt_srv = select(ServerDB).where(ServerDB.name == server_name)
+        res_srv = await s.execute(stmt_srv)
+        servers = list(res_srv.scalars().all())
+        res_srv.close()
+        server = servers[0] if servers else None
+        now = datetime.now(timezone.utc)
+        if server is None:
+            server = ServerDB(
+                name=server_name,
+                command=command or "python",
+                args=args if args is not None else [],
+                env_vars=safe_env if safe_env is not None else {},
+                is_active=is_active if is_active is not None else True,
+                trust_status="UNTRUSTED",
+                last_discovery_time=now
+            )
+            s.add(server)
+            await s.flush()
+        else:
+            if command is not None:
+                server.command = command
+            if args is not None:
+                server.args = args
+            if safe_env is not None:
+                server.env_vars = safe_env
+            if is_active is not None:
+                server.is_active = is_active
+            if not server.trust_status:
+                server.trust_status = "UNTRUSTED"
+            server.last_discovery_time = now
+            await s.flush()
+
+        saved_tools = []
+        for tool_dict in tools:
+            tool_name = tool_dict.get("name", "")
+            description = tool_dict.get("description", "") or ""
+            input_schema = tool_dict.get("inputSchema")
+            if input_schema is None:
+                input_schema = tool_dict.get("input_schema", {})
+            if input_schema is None:
+                input_schema = {}
+
+            stmt = select(ToolDB).where(ToolDB.server_id == server.id, ToolDB.name == tool_name)
+            res_tool = await s.execute(stmt)
+            tools_found = list(res_tool.scalars().all())
+            res_tool.close()
+            tool = tools_found[0] if tools_found else None
+
+            if tool is None:
+                tool = ToolDB(
+                    server_id=server.id,
+                    server_name=server_name,
+                    name=tool_name,
+                    description=description,
+                    input_schema=input_schema
+                )
+                s.add(tool)
+                await s.flush()
+            else:
+                tool.description = description
+                tool.input_schema = input_schema
+                await s.flush()
+            saved_tools.append(tool)
+
+        await s.commit()
+        return saved_tools
+
+    return await _run_with_retry(_op, session=session)
+
+
+async def set_server_active_state(
+    server_name: str,
+    is_active: bool,
+    session: Optional[AsyncSession] = None
+) -> Optional[ServerDB]:
+    """Update ServerDB is_active flag while preserving all historical records."""
+    async def _op(s: AsyncSession):
+        stmt = select(ServerDB).where(ServerDB.name == server_name)
+        res = await s.execute(stmt)
+        servers = list(res.scalars().all())
+        res.close()
+        server = servers[0] if servers else None
+        if server:
+            server.is_active = is_active
+            server.updated_at = datetime.now(timezone.utc)
+            await s.commit()
+        return server
+
+    return await _run_with_retry(_op, session=session)
+
+
+async def reconcile_server_active_states(
+    active_servers: Optional[List[str]] = None,
+    configured_servers: Optional[List[str]] = None,
+    session: Optional[AsyncSession] = None
+) -> Dict[str, bool]:
+    """Reconcile ServerDB.is_active in PostgreSQL using config as authoritative.
+
+    - config.active_servers is authoritative for which servers should be active.
+    - Servers present in active_servers AND configured in config.servers -> is_active = True
+    - Servers absent from active_servers or unconfigured -> is_active = False
+    - Preserves historical records, approved hashes, tool baselines, and trust_status.
+    - Never deletes rows from ServerDB, ToolDB, or ApprovedHashDB.
+    - Existing servers with complete approved baselines remain TRUSTED.
+    """
+    async def _op(s: AsyncSession) -> Dict[str, bool]:
+        if active_servers is None or configured_servers is None:
+            from mcpath.config.settings import settings
+            config = settings.get_server_config()
+            target_active = active_servers if active_servers is not None else (
+                getattr(config, "active_servers", None) or ([config.active_server] if config.active_server else [])
+            )
+            target_configured = configured_servers if configured_servers is not None else list(config.servers.keys())
+        else:
+            target_active = active_servers
+            target_configured = configured_servers
+
+        active_set = set(target_active) & set(target_configured)
+
+        stmt = select(ServerDB)
+        res = await s.execute(stmt)
+        servers = list(res.scalars().all())
+        res.close()
+        now = datetime.now(timezone.utc)
+        reconciled = {}
+        for srv in servers:
+            should_be_active = (srv.name in active_set)
+            if srv.is_active != should_be_active:
+                srv.is_active = should_be_active
+                srv.updated_at = now
+            reconciled[srv.name] = should_be_active
+
+        await s.commit()
+        return reconciled
+
+    return await _run_with_retry(_op, session=session)
+
+
+async def get_server_db_status(
+    server_name: Optional[str] = None,
+    session: Optional[AsyncSession] = None
+) -> List[Dict[str, Any]]:
+    """Query servers from database with discovered tool and active approved baseline counts."""
+    async def _op(s: AsyncSession):
+        stmt = select(ServerDB)
+        if server_name:
+            stmt = stmt.where(ServerDB.name == server_name)
+        res_srv = await s.execute(stmt)
+        servers = list(res_srv.scalars().all())
+        res_srv.close()
+
+        tool_counts_stmt = select(ToolDB.server_id, func.count(ToolDB.id)).group_by(ToolDB.server_id)
+        res_tools = await s.execute(tool_counts_stmt)
+        tool_counts = dict(res_tools.all())
+        res_tools.close()
+
+        hash_counts_stmt = (
+            select(ApprovedHashDB.server_name, func.count(ApprovedHashDB.id))
+            .where(ApprovedHashDB.is_active == True)
+            .group_by(ApprovedHashDB.server_name)
+        )
+        res_hashes = await s.execute(hash_counts_stmt)
+        hash_counts = dict(res_hashes.all())
+        res_hashes.close()
+
+        status_list = []
+        for srv in servers:
+            tool_count = tool_counts.get(srv.id, 0)
+            approved_count = hash_counts.get(srv.name, 0)
+            unapproved_count = max(0, tool_count - approved_count)
+
+            if srv.trust_status:
+                trust_status = srv.trust_status
+            elif tool_count > 0 and approved_count == tool_count:
+                trust_status = "TRUSTED"
+            else:
+                trust_status = "UNTRUSTED"
+
+            status_list.append({
+                "id": srv.id,
+                "name": srv.name,
+                "command": srv.command,
+                "args": srv.args,
+                "active": srv.is_active,
+                "is_active": srv.is_active,
+                "connected": False,
+                "trust_status": trust_status,
+                "discovered_tool_count": tool_count,
+                "approved_tool_count": approved_count,
+                "unapproved_tool_count": unapproved_count,
+                "last_discovery_time": srv.last_discovery_time.isoformat() if srv.last_discovery_time else (srv.created_at.isoformat() if srv.created_at else None),
+                "last_trust_time": srv.last_trust_time.isoformat() if srv.last_trust_time else None,
+                "created_at": srv.created_at.isoformat() if srv.created_at else None,
+            })
+        return status_list
+
+    return await _run_with_retry(_op, session=session)
+
+
 async def get_approved_hash(
     server_name: str,
     tool_name: str,
@@ -321,7 +604,9 @@ async def get_approved_hash(
             .order_by(ApprovedHashDB.id.desc())
         )
         res = await s.execute(stmt)
-        return res.scalar_one_or_none()
+        rows = list(res.scalars().all())
+        res.close()
+        return rows[0] if rows else None
 
     return await _run_with_retry(_op, session=session)
 
@@ -403,7 +688,6 @@ async def persist_security_event(
         s.add(decision_rec)
 
         await s.commit()
-        await s.refresh(sec_event)
         return sec_event
 
     return await _run_with_retry(_op, session=session)
@@ -492,17 +776,33 @@ async def persist_tool_capabilities(
 ) -> None:
     """Persist classified tool capabilities into capabilities table."""
     async def _op(s: AsyncSession):
+        # 1. Clear existing capabilities for clean refresh
+        await s.execute(text("DELETE FROM capabilities"))
+
+        # Pre-fetch all tools into lookup dictionary to avoid nested queries in loop
+        stmt = select(ToolDB.id, ToolDB.name, ToolDB.server_name)
+        tool_res = await s.execute(stmt)
+        tool_rows = tool_res.all()
+        tool_lookup: Dict[Any, int] = {}
+        for tid, tname, tsrv in tool_rows:
+            if tsrv:
+                tool_lookup[(tname, tsrv)] = tid
+            tool_lookup[tname] = tid
+
         for cap in capabilities:
             tool_name = cap.get("tool_name", "")
-            # Look up tool_id if exists
-            stmt = select(ToolDB.id).where(ToolDB.name == tool_name)
-            res = await s.execute(stmt)
-            tool_id = res.scalar_one_or_none()
+            server_name = cap.get("server_name")
+            tool_id = tool_lookup.get((tool_name, server_name)) or tool_lookup.get(tool_name)
+
+            # Handle collision-namespaced tool names (e.g. filesystem_list_directory -> list_directory)
+            if tool_id is None and server_name and tool_name.startswith(f"{server_name}_"):
+                raw_name = tool_name[len(server_name) + 1:]
+                tool_id = tool_lookup.get((raw_name, server_name)) or tool_lookup.get(raw_name)
 
             cap_rec = CapabilityDB(
                 tool_id=tool_id,
                 tool_name=tool_name,
-                server_name=cap.get("server_name"),
+                server_name=server_name,
                 resource_type=cap.get("data_target"),
                 action=cap.get("action_type"),
                 operation=cap.get("operation"),

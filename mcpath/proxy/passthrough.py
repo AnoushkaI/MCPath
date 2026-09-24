@@ -65,6 +65,12 @@ class PassthroughProxy:
 
     async def run(self):
         """Start the stdio proxy loop across all configured downstream servers."""
+        from mcpath.backend.persistence.database import reconcile_server_active_states
+        try:
+            await reconcile_server_active_states()
+        except Exception as e:
+            logger.debug("Server active state reconciliation on proxy run skipped: %s", e)
+
         logger.info(
             "Starting MCPath multi-server proxy for servers: %s",
             list(self.server_defs.keys())

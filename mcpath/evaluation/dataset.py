@@ -3,7 +3,7 @@
 Scenario coverage (Section 6):
 1. Normal calls
 2. Rug pulls (tampered tool definitions)
-3. Dangerous cross-tool capability chains (e.g. read_customer -> send_email)
+3. Dangerous cross-tool capability chains (e.g. read_file -> send_external_http or postgres_mcp_query -> git_commit/push)
 4. Intent mismatches (e.g. summarize vs delete_repository)
 5. Behavioural deviations (unexpected arguments, irregular destinations)
 6. Malicious / prompt-injection tool responses

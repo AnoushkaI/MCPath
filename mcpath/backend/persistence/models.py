@@ -41,6 +41,9 @@ class ServerDB(Base):
     args = Column(JSON, default=list, nullable=False)
     env_vars = Column(JSON, default=dict, nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
+    trust_status = Column(String(20), default="UNTRUSTED", nullable=False)
+    last_discovery_time = Column(DateTime(timezone=True), nullable=True)
+    last_trust_time = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc), nullable=False)
 

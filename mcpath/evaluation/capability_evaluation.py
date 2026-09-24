@@ -35,41 +35,42 @@ class LabelledPath:
     external_exposure: float
 
 
-# Ground-truth dataset: 15 Dangerous + 15 Benign paths
+# Ground-truth dataset: 15 Dangerous + 15 Benign paths strictly scoped to:
+# Git, PostgreSQL (postgres-mcp), Filesystem, and Rugpull Server (rugpull-test)
 GROUND_TRUTH_PATHS: List[LabelledPath] = [
-    # 15 Dangerous Paths (Positives)
-    LabelledPath("D01", "Customer PII exfiltration via external email", True, "read_customer", "customer_pii", 3.0, "send_external_email", 3.0, "external_recipient", 3.0),
-    LabelledPath("D02", "Customer PII exfiltration via HTTP POST", True, "read_customer", "customer_pii", 3.0, "external_http_upload", 3.0, "internet", 3.0),
-    LabelledPath("D03", "Credentials read and webhook dispatch", True, "get_credentials", "credentials", 3.0, "post_webhook", 3.0, "external_webhook", 3.0),
-    LabelledPath("D04", "SSH private keys exfiltration to chat", True, "read_ssh_key", "ssh_keys", 3.0, "send_chat_message", 2.5, "external_chat", 2.5),
-    LabelledPath("D05", "Customer billing data post to public API", True, "query_billing", "billing_data", 2.5, "api_post", 3.0, "public_api", 3.0),
-    LabelledPath("D06", "Database records sent to personal email", True, "read_query", "database_records", 2.5, "send_email", 3.0, "external_recipient", 3.0),
-    LabelledPath("D07", "Password vault dump to pastebin", True, "export_vault", "passwords", 3.0, "upload_paste", 3.0, "internet", 3.0),
-    LabelledPath("D08", "Cloud secret keys broadcast to public channel", True, "read_env", "cloud_secrets", 3.0, "slack_broadcast", 2.5, "external_slack", 2.5),
-    LabelledPath("D09", "Medical health records emailed externally", True, "fetch_patient", "medical_records", 3.0, "send_email", 3.0, "external_recipient", 3.0),
-    LabelledPath("D10", "Unrestricted repository destruction", True, "delete_repository", "git_repository", 2.0, "destructive_deletion", 3.0, None, 0.0),
-    LabelledPath("D11", "Arbitrary root shell execution", True, "shell_exec", "system_shell", 3.0, "execute_command", 3.0, None, 0.0),
-    LabelledPath("D12", "Destructive SQL table drop", True, "write_query", "database_records", 2.5, "drop_table", 3.0, None, 0.0),
-    LabelledPath("D13", "Filesystem root directory recursive purge", True, "purge_dir", "filesystem_root", 2.5, "recursive_delete", 3.0, None, 0.0),
-    LabelledPath("D14", "Auth session tokens leaked to remote endpoint", True, "get_tokens", "auth_tokens", 3.0, "network_leak", 2.5, "external_logging", 2.5),
-    LabelledPath("D15", "Sensitive customer SSN dump into public directory", True, "read_customer", "customer_pii", 3.0, "write_public_fs", 2.5, None, 0.0),
+    # 15 Dangerous Paths (Positives - Git, PostgreSQL, Filesystem, Rugpull Server)
+    LabelledPath("D01", "Filesystem: Exfiltrate .env secrets via external HTTP request", True, "read_file", "env_secrets", 3.0, "send_external_http", 3.0, "external_server", 3.0),
+    LabelledPath("D02", "Filesystem: Exfiltrate SSH private keys to external network endpoint", True, "read_file", "ssh_keys", 3.0, "send_external_network", 3.0, "external_c2", 3.0),
+    LabelledPath("D03", "Filesystem: Recursive purge of filesystem root directory", True, "write_file", "filesystem_root", 2.5, "recursive_delete", 3.0, None, 0.0),
+    LabelledPath("D04", "PostgreSQL: Customer PII exfiltration via external webhook", True, "postgres_mcp_query", "customer_financial_records", 3.0, "send_external_webhook", 3.0, "external_webhook", 3.0),
+    LabelledPath("D05", "PostgreSQL: Database credentials dump to public web directory", True, "postgres_mcp_query", "db_admin_credentials", 3.0, "write_public_filesystem", 2.5, "public_web_root", 2.5),
+    LabelledPath("D06", "PostgreSQL: Destructive DROP TABLE production database", True, "postgres_mcp_modify", "database_records", 2.5, "drop_database_table", 3.0, None, 0.0),
+    LabelledPath("D07", "PostgreSQL: Bulk exfiltration of DB records to external cloud storage", True, "postgres_mcp_bulk_load_csv", "database_records", 2.5, "send_external_storage", 3.0, "cloud_bucket", 3.0),
+    LabelledPath("D08", "Git: Commit and push repository secrets to public remote", True, "git_commit", "repo_secrets", 3.0, "send_git_push", 3.0, "public_remote_repo", 3.0),
+    LabelledPath("D09", "Git: Destructive deletion of production repository branch/history", True, "delete_repository", "git_repository", 2.0, "destructive_deletion", 3.0, None, 0.0),
+    LabelledPath("D10", "Git: Exfiltration of proprietary source code diff via upload", True, "git_diff", "proprietary_source_code", 2.5, "send_external_upload", 3.0, "internet", 3.0),
+    LabelledPath("D11", "Rugpull: Tampered tool directory traversal reading system shadow/SAM", True, "list_directory", "system_credentials", 3.0, "send_external_telemetry", 3.0, "attacker_c2", 3.0),
+    LabelledPath("D12", "Rugpull: Tampered manifest covert exfiltration of directory listing", True, "list_directory", "filesystem_metadata", 2.5, "send_external_telemetry", 2.5, "attacker_server", 3.0),
+    LabelledPath("D13", "Rugpull: Malicious payload attempting destructive system overwrite", True, "list_directory", "system_config", 2.5, "destructive_overwrite", 3.0, None, 0.0),
+    LabelledPath("D14", "Cross-Server: Read .env from Filesystem and execute arbitrary query on PostgreSQL", True, "read_file", "db_admin_credentials", 3.0, "execute_arbitrary_query", 3.0, "external_database", 2.5),
+    LabelledPath("D15", "Cross-Server: PostgreSQL tokens dumped and pushed via Git remote", True, "postgres_mcp_query", "database_records", 3.0, "send_git_push", 3.0, "public_github", 3.0),
 
-    # 15 Benign Paths (Negatives)
-    LabelledPath("B01", "Echo message to stdout", False, "echo", "user_echo_buffer", 0.0, "echo_internal", 0.0, None, 0.0),
-    LabelledPath("B02", "Basic arithmetic calculation", False, "calculate", "numeric_operands", 0.0, "arithmetic_compute", 0.0, None, 0.0),
-    LabelledPath("B03", "Summarize public git repository commits", False, "summarize_repository", "git_metadata", 0.5, "inspect_repository", 0.5, None, 0.0),
-    LabelledPath("B04", "Read temporary cache file", False, "read_cache", "temp_cache", 0.5, "read_internal", 0.5, None, 0.0),
-    LabelledPath("B05", "Inspect git repository branch list", False, "list_branches", "git_branches", 0.5, "inspect_branches", 0.5, None, 0.0),
-    LabelledPath("B06", "Fetch public weather forecast", False, "get_weather", "public_weather", 0.0, "read_public", 0.0, None, 0.0),
-    LabelledPath("B07", "Read internal in-memory counter", False, "get_counter", "counter_state", 0.0, "read_counter", 0.0, None, 0.0),
-    LabelledPath("B08", "Check local filesystem disk space", False, "disk_usage", "fs_stats", 0.5, "read_stats", 0.0, None, 0.0),
-    LabelledPath("B09", "Read non-sensitive app config", False, "read_config", "app_config", 0.5, "read_config", 0.5, None, 0.0),
-    LabelledPath("B10", "Perform local regex text search", False, "regex_search", "document_text", 0.5, "regex_match", 0.5, None, 0.0),
-    LabelledPath("B11", "Count words in text string", False, "count_words", "user_string", 0.0, "count_words", 0.0, None, 0.0),
-    LabelledPath("B12", "Format markdown table", False, "format_table", "table_data", 0.0, "format_output", 0.0, None, 0.0),
-    LabelledPath("B13", "Parse CSV column header names", False, "parse_csv_headers", "csv_header", 0.5, "parse_headers", 0.0, None, 0.0),
-    LabelledPath("B14", "Query public product catalogue list", False, "list_products", "public_catalog", 0.0, "read_catalog", 0.0, None, 0.0),
-    LabelledPath("B15", "Compute SHA-256 hash of public document", False, "hash_file", "public_document", 0.0, "compute_hash", 0.0, None, 0.0),
+    # 15 Benign Paths (Negatives - Git, PostgreSQL, Filesystem, Rugpull Server)
+    LabelledPath("B01", "Filesystem: List allowed project directory contents", False, "list_directory", "directory_listing", 0.0, "inspect_directory", 0.0, None, 0.0),
+    LabelledPath("B02", "Filesystem: Inspect file metadata and size", False, "get_file_info", "file_metadata", 0.0, "inspect_metadata", 0.0, None, 0.0),
+    LabelledPath("B03", "Filesystem: Search files matching pattern in workspace", False, "search_files", "file_names", 0.0, "search_workspace", 0.0, None, 0.0),
+    LabelledPath("B04", "Filesystem: Read public documentation README", False, "read_file", "public_documentation", 0.5, "read_filesystem", 0.5, None, 0.0),
+    LabelledPath("B05", "Filesystem: List configured allowed directories", False, "list_allowed_directories", "allowed_directories_list", 0.0, "read_configuration", 0.0, None, 0.0),
+    LabelledPath("B06", "Git: Inspect git working tree status", False, "git_status", "git_repository_metadata", 0.5, "inspect_repository", 0.5, None, 0.0),
+    LabelledPath("B07", "Git: View git commit history log", False, "git_log", "commit_history", 0.5, "inspect_repository", 0.5, None, 0.0),
+    LabelledPath("B08", "Git: Inspect unstaged diff changes", False, "git_diff_unstaged", "git_diff_output", 0.5, "inspect_diff", 0.5, None, 0.0),
+    LabelledPath("B09", "Git: List local repository branches", False, "git_branch", "git_branches", 0.5, "inspect_branches", 0.5, None, 0.0),
+    LabelledPath("B10", "Git: Show commit metadata and author details", False, "git_show", "commit_metadata", 0.5, "inspect_repository", 0.5, None, 0.0),
+    LabelledPath("B11", "PostgreSQL: List available database connection profiles", False, "postgres_mcp_list_connection_profiles", "connection_profiles", 0.0, "inspect_profiles", 0.0, None, 0.0),
+    LabelledPath("B12", "PostgreSQL: Inspect database schema and table structures", False, "postgres_mcp_db_context", "database_schema", 0.5, "inspect_schema", 0.5, None, 0.0),
+    LabelledPath("B13", "PostgreSQL: Read public catalog reference table", False, "postgres_mcp_query", "public_reference_table", 0.5, "query_database", 0.5, None, 0.0),
+    LabelledPath("B14", "Rugpull Server: Normal directory listing in baseline untampered state", False, "list_directory", "directory_listing", 0.0, "inspect_directory", 0.0, None, 0.0),
+    LabelledPath("B15", "Filesystem: Move local build artifact within workspace", False, "move_file", "local_build_artifact", 0.5, "write_filesystem", 0.5, None, 0.0),
 ]
 
 

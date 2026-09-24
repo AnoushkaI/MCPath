@@ -7,6 +7,8 @@ multiple configured downstream MCP servers (Filesystem, Git, PostgreSQL, etc.).
 
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+import json
 import logging
 import os
 from pathlib import Path
@@ -40,6 +42,19 @@ def set_active_client_manager(manager: Optional["DownstreamClientManager"]) -> N
     """Register active DownstreamClientManager instance."""
     global _ACTIVE_CLIENT_MANAGER
     _ACTIVE_CLIENT_MANAGER = manager
+
+
+def save_server_config_file(config: ServerConfig) -> None:
+    """Persist updated ServerConfig to server_config.json on disk."""
+    p = Path(settings.server_config_path)
+    if not p.is_absolute():
+        p = (PROJECT_ROOT / p).resolve()
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(config.model_dump(), f, indent=2)
+        logger.info("Persisted updated configuration to %s", p)
+    except Exception as e:
+        logger.warning("Could not persist server_config.json: %s", e)
 
 
 @dataclass
@@ -315,13 +330,50 @@ class DownstreamClientManager:
 
         self.exposed_tools = new_exposed
         self.capability_graph.rebuild_for_all_servers(graph_tools)
+        # In test environments (e.g. pytest), skip un-awaited background DB writes to prevent SQLite lock collisions
+        if os.environ.get("PYTEST_CURRENT_TEST") and not getattr(self, "force_persist_graph", False):
+            logger.info(
+                "Aggregated catalog updated: %d tools exposed across %d connected servers (%d unavailable)",
+                len(self.exposed_tools),
+                len(self.sessions),
+                len(self.unavailable_servers)
+            )
+            return
+
         try:
             import asyncio
-            from mcpath.backend.persistence.database import persist_capability_graph
+            from mcpath.backend.persistence.database import (
+                persist_capability_graph,
+                persist_tool_capabilities,
+            )
             loop = asyncio.get_running_loop()
             if loop.is_running():
                 exported = self.capability_graph.export_graph()
-                loop.create_task(persist_capability_graph(exported))
+                raw_caps = [
+                    {
+                        "tool_name": cap.tool_name,
+                        "server_name": cap.server_name,
+                        "data_target": cap.data_target,
+                        "operation": cap.operation,
+                        "action_type": cap.action_type,
+                        "external_destination": cap.external_destination,
+                        "data_sensitivity": cap.data_sensitivity,
+                        "action_sensitivity": cap.action_sensitivity,
+                        "external_exposure": cap.external_exposure,
+                        "policy_version": cap.policy_version,
+                        "raw_metadata": cap.raw_metadata,
+                    }
+                    for cap in self.capability_graph.tool_capabilities.values()
+                ]
+
+                async def _persist_bg():
+                    try:
+                        await persist_capability_graph(exported)
+                        await persist_tool_capabilities(raw_caps)
+                    except Exception as ex:
+                        logger.debug("Background capability persistence skipped: %s", ex)
+
+                loop.create_task(_persist_bg())
         except (RuntimeError, Exception) as e:
             logger.debug("Capability graph persistence deferred or skipped: %s", e)
 
@@ -430,8 +482,6 @@ class DownstreamClientManager:
         """Dynamic controlled reload: detects added/removed/changed servers, reconnects, and refreshes catalog."""
         config = new_config or settings.get_server_config()
         target_server_names = config.active_servers if hasattr(config, "active_servers") and config.active_servers else list(config.servers.keys())
-
-        # Exclude sample_reference_server unless explicitly targeted
         target_server_names = [s for s in target_server_names if s in config.servers]
 
         current_servers = set(self.server_defs.keys())
@@ -467,6 +517,16 @@ class DownstreamClientManager:
         # 4. Recompute aggregated tools and update capability graph
         self.recompute_exposed_tools()
 
+        # 5. Synchronize DB ServerDB.is_active states with reloaded active_servers
+        from mcpath.backend.persistence.database import reconcile_server_active_states
+        try:
+            await reconcile_server_active_states(
+                active_servers=list(target_servers),
+                configured_servers=list(config.servers.keys())
+            )
+        except Exception as e:
+            logger.warning("Could not reconcile DB server states during reload: %s", e)
+
         summary = {
             "status": "success",
             "active_servers": list(self.sessions.keys()),
@@ -477,3 +537,329 @@ class DownstreamClientManager:
         }
         logger.info("Dynamic reload complete: %s", summary)
         return summary
+
+    async def add_server(
+        self,
+        name: str,
+        command: str,
+        args: Optional[List[str]] = None,
+        env: Optional[Dict[str, str]] = None,
+        transport: str = "stdio",
+        session: Optional[Any] = None
+    ) -> Dict[str, Any]:
+        """Add and discover an MCP server.
+
+        Security Model: ADDING != TRUSTING
+        1. Validates configuration.
+        2. Persists to server_config.json.
+        3. Connects to real MCP server.
+        4. Discovers tools via tools/list.
+        5. Namespaces collisions and builds capability graph.
+        6. Persists capabilities, nodes, edges, paths to PostgreSQL.
+        7. Computes observed SHA-256 hashes using Stage 1 canonicalization.
+        8. Persists tools to PostgreSQL ToolDB WITHOUT creating ApprovedHashDB rows.
+        9. Marks server trust_status = 'UNTRUSTED'.
+        Tools remain NO_APPROVED_BASELINE and will fail-closed in Stage 1.
+        """
+        if not name or not name.strip():
+            raise ValueError("Server name is required")
+        if not command or not command.strip():
+            raise ValueError("Server command is required")
+
+        server_name = name.strip()
+        s_def = ServerDefinition(command=command, args=args or [], env=env or {})
+
+        # 1. Update server_config.json: persist server definition, ensure not in active_servers until connected
+        config = settings.get_server_config()
+        config.servers[server_name] = s_def
+        if hasattr(config, "active_servers") and config.active_servers is not None:
+            config.active_servers = [s for s in config.active_servers if s != server_name]
+        try:
+            save_server_config_file(config)
+        except Exception as e:
+            logger.warning("Could not update server_config.json for '%s': %s", server_name, e)
+
+        # 2. Add to in-memory server definitions
+        interpolated_def = interpolate_server_config(s_def, settings)
+        self.server_defs[server_name] = interpolated_def
+
+        # 3. Connect to downstream server
+        connected = await self.connect_server(server_name)
+        state = self.servers_state.get(server_name)
+        if not connected or not state or not state.is_connected:
+            err_msg = state.error if state else "Connection failed"
+            self.server_defs.pop(server_name, None)
+            from mcpath.backend.persistence.database import save_discovered_tools
+            try:
+                await save_discovered_tools(
+                    server_name=server_name,
+                    tools=[],
+                    command=command,
+                    args=args,
+                    env_vars=env,
+                    is_active=False,
+                    session=session
+                )
+            except Exception:
+                pass
+            raise DownstreamConnectionError(f"Failed to connect to MCP server '{server_name}': {err_msg}")
+
+        # 4. Connection succeeded: add to active_servers in server_config.json
+        if hasattr(config, "active_servers") and config.active_servers is not None:
+            if server_name not in config.active_servers:
+                config.active_servers.append(server_name)
+                try:
+                    save_server_config_file(config)
+                except Exception as e:
+                    logger.warning("Could not save active_servers for '%s': %s", server_name, e)
+
+        # 5. Recompute exposed tools, namespace duplicate names, rebuild graph & paths, persist to DB
+        self.recompute_exposed_tools()
+
+        # 6. Calculate observed SHA-256 definition hashes using existing Stage 1 canonicalization
+        from mcpath.pipeline.stages.stage1_hash import canonicalize_and_hash
+        from mcpath.backend.persistence.database import save_discovered_tools
+
+        observed_hashes: Dict[str, str] = {}
+        raw_tools: List[Dict[str, Any]] = []
+        for t_name, tool_obj in state.tools.items():
+            tool_dict = tool_obj.model_dump(mode="json")
+            raw_tools.append(tool_dict)
+            _, sha = canonicalize_and_hash(tool_dict)
+            observed_hashes[t_name] = sha
+
+        # 7. Persist server and discovered tools to ToolDB with is_active=True (UNTRUSTED, NO approved baseline)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await save_discovered_tools(
+                server_name=server_name,
+                tools=raw_tools,
+                command=command,
+                args=args,
+                env_vars=env,
+                is_active=True,
+                session=session
+            )
+        except Exception as e:
+            logger.warning("Could not persist discovered tools to DB for '%s': %s", server_name, e)
+
+        return {
+            "name": server_name,
+            "active": True,
+            "is_active": True,
+            "connected": True,
+            "trust_status": "UNTRUSTED",
+            "discovered_tool_count": len(raw_tools),
+            "approved_tool_count": 0,
+            "unapproved_tool_count": len(raw_tools),
+            "observed_hashes": observed_hashes,
+            "last_discovery_time": now_iso,
+            "last_trust_time": None,
+            "message": f"Server '{server_name}' added and analyzed. Trust status: UNTRUSTED. Tools have NO_APPROVED_BASELINE."
+        }
+
+    async def trust_server(self, server_name: str, session: Optional[Any] = None) -> Dict[str, Any]:
+        """Trust & Register all tools of an MCP server with ONE server-level action.
+
+        1. Confirms server is connected.
+        2. Calls tools/list again.
+        3. Retrieves complete definitions.
+        4. Canonicalizes and computes SHA-256 using Stage 1 implementation.
+        5. Stores current hashes as approved baseline in ApprovedHashDB.
+        6. Updates ServerDB trust_status = 'TRUSTED' and approval timestamp.
+        """
+        if server_name not in self.server_defs:
+            config = settings.get_server_config()
+            if server_name in config.servers:
+                self.server_defs[server_name] = interpolate_server_config(config.servers[server_name], settings)
+            else:
+                raise ValueError(f"Server '{server_name}' not found")
+
+        state = self.servers_state.get(server_name)
+        if not state or not state.is_connected:
+            connected = await self.connect_server(server_name)
+            if not connected:
+                raise DownstreamConnectionError(f"Server '{server_name}' is not connected and could not be reached")
+            state = self.servers_state[server_name]
+
+        # Call tools/list again on live session
+        tools_res = await state.session.list_tools()
+        raw_tools = [t.model_dump(mode="json") for t in tools_res.tools]
+        state.tools = {t.name: t for t in tools_res.tools}
+
+        from mcpath.pipeline.stages.stage1_hash import canonicalize_and_hash
+        from mcpath.backend.persistence.database import register_trusted_server_and_tools
+
+        synced = await register_trusted_server_and_tools(
+            server_name=server_name,
+            tools=raw_tools,
+            canonicalize_and_hash_fn=canonicalize_and_hash,
+            command=self.server_defs[server_name].command,
+            args=self.server_defs[server_name].args,
+            env_vars=self.server_defs[server_name].env,
+            approved_by="admin:trusted_registration",
+            session=session
+        )
+
+        self.recompute_exposed_tools()
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        config = settings.get_server_config()
+        active_set = set(getattr(config, "active_servers", None) or ([config.active_server] if config.active_server else []))
+        is_active = (server_name in active_set and server_name in config.servers)
+
+        return {
+            "name": server_name,
+            "active": is_active,
+            "is_active": is_active,
+            "connected": True,
+            "trust_status": "TRUSTED",
+            "discovered_tool_count": len(raw_tools),
+            "approved_tool_count": len(raw_tools),
+            "unapproved_tool_count": 0,
+            "approved_hashes": [
+                {"tool_name": tool.name, "hash_sha256": ah.hash_sha256}
+                for tool, ah in synced
+            ],
+            "last_discovery_time": now_iso,
+            "last_trust_time": now_iso,
+            "message": f"Server '{server_name}' trusted and registered. Approved baseline created for {len(raw_tools)} tools."
+        }
+
+    async def deactivate_server(self, server_name: str, session: Optional[Any] = None) -> Dict[str, Any]:
+        """Deactivate server: disconnect session, remove from exposed catalog and graph, preserve DB data."""
+        # 1. Update server_config.json
+        try:
+            config = settings.get_server_config()
+            if hasattr(config, "active_servers") and config.active_servers:
+                if server_name in config.active_servers:
+                    config.active_servers = [s for s in config.active_servers if s != server_name]
+                    save_server_config_file(config)
+        except Exception as e:
+            logger.warning("Could not update active_servers in server_config.json: %s", e)
+
+        # 2. Update ServerDB.is_active = False in PostgreSQL
+        from mcpath.backend.persistence.database import set_server_active_state
+        try:
+            await set_server_active_state(server_name, is_active=False, session=session)
+        except Exception as e:
+            logger.warning("Could not update ServerDB.is_active in DB: %s", e)
+
+        # 3. Disconnect live session
+        await self.disconnect_server(server_name)
+
+        # 4. Remove from capability graph
+        self.capability_graph.remove_server(server_name)
+
+        # 5. Recompute exposed tools (removes from catalog & graph, rebuilds paths, persists to DB)
+        self.recompute_exposed_tools()
+
+        status = await self.get_server_status(server_name, session=session)
+        status["active"] = False
+        status["is_active"] = False
+        status["connected"] = False
+        status["message"] = f"Server '{server_name}' deactivated. Tools removed from active catalog and graph."
+        return status
+
+    async def activate_server(self, server_name: str, session: Optional[Any] = None) -> Dict[str, Any]:
+        """Activate server: connect, discover tools, rebuild graph, restore to catalog. (DO NOT re-baseline)."""
+        config = settings.get_server_config()
+        if server_name not in self.server_defs:
+            if server_name in config.servers:
+                self.server_defs[server_name] = interpolate_server_config(config.servers[server_name], settings)
+            else:
+                raise ValueError(f"Server '{server_name}' not found in configuration")
+
+        # 1. Connect to downstream server
+        connected = await self.connect_server(server_name)
+        if not connected:
+            state = self.servers_state.get(server_name)
+            err = state.error if state else "Connection failed"
+            raise DownstreamConnectionError(f"Failed to activate server '{server_name}': {err}")
+
+        # 2. Add to active_servers in server_config.json
+        try:
+            if hasattr(config, "active_servers") and config.active_servers is not None:
+                if server_name not in config.active_servers:
+                    config.active_servers.append(server_name)
+                    save_server_config_file(config)
+        except Exception as e:
+            logger.warning("Could not update active_servers in server_config.json: %s", e)
+
+        # 3. Update ServerDB.is_active = True
+        from mcpath.backend.persistence.database import set_server_active_state
+        try:
+            await set_server_active_state(server_name, is_active=True, session=session)
+        except Exception as e:
+            logger.warning("Could not update ServerDB.is_active in DB: %s", e)
+
+        # 4. Recompute exposed tools, rebuild graph and paths, persist to DB
+        self.recompute_exposed_tools()
+
+        status = await self.get_server_status(server_name, session=session)
+        status["active"] = True
+        status["is_active"] = True
+        status["connected"] = True
+        status["message"] = f"Server '{server_name}' activated."
+        return status
+
+    async def get_server_status(self, server_name: str, session: Optional[Any] = None) -> Dict[str, Any]:
+        """Return status for a single server combining live connection and database baseline info."""
+        from mcpath.backend.persistence.database import get_server_db_status
+        db_stat = None
+        try:
+            db_statuses = await get_server_db_status(server_name=server_name, session=session)
+            db_stat = db_statuses[0] if db_statuses else None
+        except Exception as e:
+            logger.debug("Could not query DB status for server '%s': %s", server_name, e)
+
+        state = self.servers_state.get(server_name)
+        is_connected = bool(state and state.is_connected)
+        live_tools_count = len(state.tools) if (state and state.is_connected) else 0
+
+        config = settings.get_server_config()
+        active_set = set(getattr(config, "active_servers", None) or ([config.active_server] if config.active_server else []))
+        is_active = (server_name in active_set and server_name in config.servers)
+
+        discovered_count = live_tools_count if is_connected else (db_stat.get("discovered_tool_count", 0) if db_stat else 0)
+        approved_count = db_stat.get("approved_tool_count", 0) if db_stat else 0
+        unapproved_count = max(0, discovered_count - approved_count)
+
+        if db_stat and db_stat.get("trust_status"):
+            trust_status = db_stat["trust_status"]
+        elif approved_count > 0 and approved_count == discovered_count:
+            trust_status = "TRUSTED"
+        else:
+            trust_status = "UNTRUSTED"
+
+        return {
+            "name": server_name,
+            "active": is_active,
+            "is_active": is_active,
+            "connected": is_connected,
+            "trust_status": trust_status,
+            "discovered_tool_count": discovered_count,
+            "approved_tool_count": approved_count,
+            "unapproved_tool_count": unapproved_count,
+            "last_discovery_time": db_stat.get("last_discovery_time") if db_stat else None,
+            "last_trust_time": db_stat.get("last_trust_time") if db_stat else None,
+        }
+
+    async def get_all_servers_status(self, session: Optional[Any] = None) -> List[Dict[str, Any]]:
+        """Return status for all known downstream MCP servers."""
+        from mcpath.backend.persistence.database import get_server_db_status
+        config = settings.get_server_config()
+        db_statuses = []
+        try:
+            db_statuses = await get_server_db_status(session=session)
+        except Exception as e:
+            logger.debug("Could not query DB status in get_all_servers_status: %s", e)
+
+        db_map = {s["name"]: s for s in db_statuses}
+        all_names = set(config.servers.keys()) | set(self.servers_state.keys()) | set(self.server_defs.keys()) | set(db_map.keys())
+
+        result = []
+        for name in sorted(all_names):
+            stat = await self.get_server_status(name, session=session)
+            result.append(stat)
+        return result

@@ -16,7 +16,7 @@ Typed Edges:
 - SENDS_TO (Action -> External Destination)
 """
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace as dc_replace
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -70,17 +70,38 @@ class CapabilityGraph:
         return self.classifier.version
 
     def rebuild_for_all_servers(self, server_tools: Dict[str, List[Dict[str, Any]]]) -> None:
-        """Rebuild capability graph dynamically representing all currently configured servers."""
+        """Rebuild capability graph dynamically representing all currently configured servers.
+
+        Tool identity uses the same collision-namespacing as
+        DownstreamClientManager.recompute_exposed_tools(): when the same raw
+        tool name appears in more than one server the canonical name becomes
+        ``{server_name}_{tool_name}``; unique names are kept as-is.
+        """
         self.graph.clear()
         self.tool_capabilities.clear()
         self._computed_paths.clear()
         self._init_root()
 
-        # 1. Classify all discovered tools deterministically
+        # 1a. First pass – count raw tool-name occurrences across all servers
+        #     (mirrors the name_counts logic in recompute_exposed_tools)
+        name_counts: Dict[str, int] = {}
+        for tools in server_tools.values():
+            for tool_def in tools:
+                raw = tool_def.get("name", "")
+                name_counts[raw] = name_counts.get(raw, 0) + 1
+
+        # 1b. Classify all discovered tools, stamping the canonical name
         for server_name, tools in server_tools.items():
             for tool_def in tools:
                 cap = self.classifier.classify_tool(server_name, tool_def)
-                self.tool_capabilities[cap.tool_name] = cap
+                # Apply the same namespacing as the exposed-tools catalog
+                if name_counts.get(cap.tool_name, 1) > 1:
+                    canonical_name = f"{server_name}_{cap.tool_name}"
+                else:
+                    canonical_name = cap.tool_name
+                if canonical_name != cap.tool_name:
+                    cap = dc_replace(cap, tool_name=canonical_name)
+                self.tool_capabilities[canonical_name] = cap
 
         # 2. Populate nodes and intra-tool edges
         for tool_name, cap in self.tool_capabilities.items():
@@ -200,9 +221,44 @@ class CapabilityGraph:
         )
 
     def add_tool(self, server_name: str, tool_def: Dict[str, Any]) -> None:
-        """Dynamically add and classify a tool into the graph on-the-fly."""
+        """Dynamically add and classify a tool into the graph on-the-fly.
+
+        Uses the same collision-namespacing rule as rebuild_for_all_servers:
+        if a different server has already registered the same raw tool name the
+        canonical name becomes ``{server_name}_{tool_name}``.
+        """
         cap = self.classifier.classify_tool(server_name, tool_def)
-        self.tool_capabilities[cap.tool_name] = cap
+        # Detect collision: same raw name already registered from a DIFFERENT server
+        raw_name = cap.tool_name
+        existing = self.tool_capabilities.get(raw_name)
+        collision = existing is not None and existing.server_name != server_name
+        if collision:
+            # The pre-existing entry also needs to be re-keyed (mirrors rebuild behaviour)
+            old_cap = self.tool_capabilities.pop(raw_name)
+            old_canonical = f"{old_cap.server_name}_{raw_name}"
+            old_cap = dc_replace(old_cap, tool_name=old_canonical)
+            self.tool_capabilities[old_canonical] = old_cap
+            canonical_name = f"{server_name}_{raw_name}"
+
+            # Rename the pre-existing graph nodes so _enumerate_all_paths can find them
+            old_tool_node = f"Tool:{raw_name}"
+            new_tool_node = f"Tool:{old_canonical}"
+            old_action_prefix = f"Action:{raw_name}:"
+            rename_map: Dict[str, str] = {}
+            for node in list(self.graph.nodes()):
+                if node == old_tool_node:
+                    rename_map[node] = new_tool_node
+                elif node.startswith(old_action_prefix):
+                    suffix = node[len(old_action_prefix):]
+                    rename_map[node] = f"Action:{old_canonical}:{suffix}"
+            if rename_map:
+                nx.relabel_nodes(self.graph, rename_map, copy=False)
+        else:
+            canonical_name = raw_name
+        if canonical_name != cap.tool_name:
+            cap = dc_replace(cap, tool_name=canonical_name)
+        self.tool_capabilities[canonical_name] = cap
+
 
         # EXACTLY ONE canonical Tool node per tool: Tool:{tool_name}
         tool_node_id = f"Tool:{cap.tool_name}"

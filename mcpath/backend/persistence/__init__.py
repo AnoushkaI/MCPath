@@ -22,6 +22,9 @@ from mcpath.backend.persistence.database import (
     register_trusted_server_and_tools,
     get_approved_hash,
     persist_security_event,
+    set_server_active_state,
+    reconcile_server_active_states,
+    get_server_db_status,
 )
 
 # Backwards compatibility alias
@@ -48,4 +51,7 @@ __all__ = [
     "register_trusted_server_and_tools",
     "get_approved_hash",
     "persist_security_event",
+    "set_server_active_state",
+    "reconcile_server_active_states",
+    "get_server_db_status",
 ]

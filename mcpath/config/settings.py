@@ -62,6 +62,10 @@ class Settings(BaseSettings):
     backend_host: str = Field(default="127.0.0.1", alias="BACKEND_HOST")
     backend_port: int = Field(default=8000, alias="BACKEND_PORT")
 
+    # Proxy Localhost Control Channel
+    proxy_control_host: str = Field(default="127.0.0.1", alias="PROXY_CONTROL_HOST")
+    proxy_control_port: int = Field(default=8765, alias="PROXY_CONTROL_PORT")
+
     # Pipeline Thresholds
     intent_similarity_threshold: float = Field(default=0.70, alias="INTENT_SIMILARITY_THRESHOLD")
     behaviour_deviation_threshold: float = Field(default=0.60, alias="BEHAVIOUR_DEVIATION_THRESHOLD")

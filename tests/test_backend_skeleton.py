@@ -26,4 +26,8 @@ async def test_backend_overview_and_servers():
 
         res_servers = await client.get("/api/servers")
         assert res_servers.status_code == 200
-        assert "active_server" in res_servers.json()
+        assert isinstance(res_servers.json(), list)
+
+        res_dict = await client.get("/api/servers?format=dict")
+        assert res_dict.status_code == 200
+        assert "active_server" in res_dict.json()

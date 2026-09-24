@@ -168,6 +168,8 @@ def create_proxy_server(
         on_list_tools=handle_list_tools,
         on_call_tool=handle_call_tool
     )
+    proxy_server.handle_call_tool = handle_call_tool
+    proxy_server.handle_list_tools = handle_list_tools
 
     return proxy_server
 
@@ -177,17 +179,23 @@ async def run_stdio_proxy(
     pipeline_runner: Optional[PipelineRunner] = None
 ) -> None:
     """Run MCPath Proxy on stdio for seamless integration with Claude Desktop / MCP hosts."""
+    from mcpath.proxy.control import ProxyControlServer
     logger.info("Starting MCPath stdio proxy...")
-    async with client_manager.session_context():
-        proxy_server = create_proxy_server(
-            client_manager=client_manager,
-            pipeline_runner=pipeline_runner
-        )
-        async with stdio_server() as (read_stream, write_stream):
-            logger.info("MCPath Proxy is listening on stdio for MCP client requests")
-            await proxy_server.run(
-                read_stream,
-                write_stream,
-                proxy_server.create_initialization_options(),
-                raise_exceptions=True
+    control_server = ProxyControlServer(client_manager)
+    await control_server.start()
+    try:
+        async with client_manager.session_context():
+            proxy_server = create_proxy_server(
+                client_manager=client_manager,
+                pipeline_runner=pipeline_runner
             )
+            async with stdio_server() as (read_stream, write_stream):
+                logger.info("MCPath Proxy is listening on stdio for MCP client requests")
+                await proxy_server.run(
+                    read_stream,
+                    write_stream,
+                    proxy_server.create_initialization_options(),
+                    raise_exceptions=True
+                )
+    finally:
+        await control_server.stop()

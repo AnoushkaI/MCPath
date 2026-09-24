@@ -263,6 +263,12 @@ The pipeline evaluates every intercepted call in two deterministic phases:
   - **Runtime Sequence Mapping & Fail-Closed Unknowns**: Maps active calls and call sequences against graph paths; reports `"CAPABILITY PATH: UNKNOWN / UNMODELED"` with elevated score (75.0) when no compatible path is found.
   - **Dynamic Server Reload**: Automatically rebuilds capability graph and recomputes paths when servers are added, changed, or removed.
   - **PostgreSQL Persistence & Observability**: Added `capability_nodes`, `capability_edges`, `capability_paths`, and enhanced `capabilities` tables with FastAPI routes (`/api/capabilities/policy`, `/api/capabilities/graph`, `/api/capabilities/paths`, `/api/capabilities/tools`) and Streamlit dashboard integration.
-  - **Empirical Evaluation Benchmark**: Evaluated policy-v1 against a 30-path benchmark dataset (15 dangerous, 15 benign), reporting precision, recall, F1, FPR, and FNR.
-  - **Comprehensive Verification**: Added `tests/test_capability_graph.py` (12 tests); full test suite elevated to **41 passing automated tests** (100% pass).
+  - **Empirical Evaluation Benchmark**: Evaluated policy-v1 against a 30-path benchmark dataset (15 dangerous, 15 benign) strictly scoped to real configured servers (`filesystem`, `git`, `postgres-mcp`, and `rugpull-test`), reporting precision, recall, F1, FPR, and FNR.
+- **2026-09-24 (Safe Mock External-Action Server + Exfiltration Path Modeling)**:
+  - **Safe Mock Email Server (`mock_servers/email_server.py`)**: Implemented an official MCP Python SDK 2.x stdio server exposing a realistic `send_email(recipient, subject, body)` tool that strictly simulates queueing with zero real email or external network requests.
+  - **Server Configuration Integration**: Added `email-server` to `active_servers` and `servers` in `config/server_config.json` for automatic multi-server discovery and lifecycle management.
+  - **Inferred Capability Modeling**: Preserved strict separation of policy from code; `send_email` capabilities are inferred dynamically via `CapabilityClassifier` from manifest definitions matching `config/capability_policy.json` (`email_outbox`, `external_communication`, `external_recipient`).
+  - **Causal Exfiltration Path Recognition**: Enables `CapabilityGraph` to construct `Resource:filesystem_data -> Action:send_email:external_communication -> Destination:external_recipient`, triggering the Critical Path Override (score >= 85.0, classification HIGH) when sensitive data flows to external communication.
+  - **Isolated Action Representation**: Verified that isolated email actions do not trigger critical path overrides unless sensitive data is attached.
+  - **Automated Verification**: Added `tests/test_mock_email_server.py` with 7 comprehensive tests; total repository automated test suite elevated to **57 passing automated tests** (100% pass).
 

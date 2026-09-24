@@ -3,9 +3,8 @@
   "active_servers": [
     "filesystem",
     "git",
-    "rugpull-test",
-    "email-server",
-    "postgres-mcp"
+    "postgres-mcp",
+    "rugpull-test"
   ],
   "servers": {
     "sample_reference_server": {
@@ -54,20 +53,6 @@
       "command": "python",
       "args": [
         "mock_servers/rugpullserver.py"
-      ],
-      "env": {}
-    },
-    "email-server": {
-      "command": "python",
-      "args": [
-        "mock_servers/email_server.py"
-      ],
-      "env": {}
-    },
-    "manual-test-server": {
-      "command": "C:\\projects\\mcp proxy\\.venv\\Scripts\\python.exe",
-      "args": [
-        "C:\\projects\\mcp proxy\\mock_servers\\sample_server.py"
       ],
       "env": {}
     }

@@ -880,3 +880,212 @@ def test_safe_mock_external_action_server_critical_override():
     assert eval_result.action_sensitivity == 3.0
     assert eval_result.external_exposure == 3.0
 
+
+
+# ---------------------------------------------------------------------------
+# Multi-server tool identity regression tests
+# Requirement: CapabilityGraph must use the same canonical tool names as
+# DownstreamClientManager.recompute_exposed_tools() for colliding tool names.
+# ---------------------------------------------------------------------------
+
+
+class TestMultiServerToolIdentity:
+    """Regression tests for the multi-server tool identity (collision-namespacing) fix.
+
+    Scenario mirrors the live five-server MCPath deployment where both the
+    'filesystem' and 'rugpull-test' servers expose a tool named 'list_directory'.
+    Before the fix this caused a silent overwrite producing:
+      - 1 ghost 'Tool:list_directory' node (attributed to whichever server was
+        processed last)
+      - 1 lost classification (the first server's list_directory was discarded)
+    After the fix the graph must match the exposed-catalog's canonical names:
+      - 'filesystem_list_directory'
+      - 'rugpull-test_list_directory'
+    """
+
+    LIST_DIR_TOOL = {
+        "name": "list_directory",
+        "description": "List the contents of a directory on the filesystem.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    }
+
+    EXTRA_UNIQUE_TOOL = {
+        "name": "read_file",
+        "description": "Read the contents of a file from the filesystem.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    }
+
+    def _build_collision_graph(self) -> CapabilityGraph:
+        """Build a minimal graph that reproduces the filesystem/rugpull collision."""
+        server_tools = {
+            "filesystem": [self.LIST_DIR_TOOL, self.EXTRA_UNIQUE_TOOL],
+            "rugpull-test": [self.LIST_DIR_TOOL],
+        }
+        graph = CapabilityGraph()
+        graph.rebuild_for_all_servers(server_tools)
+        return graph
+
+    def test_collision_produces_two_namespaced_tool_capabilities(self):
+        """Both colliding tools must appear in tool_capabilities under namespaced keys."""
+        graph = self._build_collision_graph()
+        assert "filesystem_list_directory" in graph.tool_capabilities, (
+            "filesystem's list_directory must be stored as 'filesystem_list_directory'"
+        )
+        assert "rugpull-test_list_directory" in graph.tool_capabilities, (
+            "rugpull-test's list_directory must be stored as 'rugpull-test_list_directory'"
+        )
+
+    def test_no_ghost_unnamespaced_list_directory_capability(self):
+        """The raw un-namespaced key must NOT survive in tool_capabilities."""
+        graph = self._build_collision_graph()
+        assert "list_directory" not in graph.tool_capabilities, (
+            "Ghost 'list_directory' entry must be absent after namespacing"
+        )
+
+    def test_two_distinct_tool_nodes_in_graph(self):
+        """The graph must contain both namespaced Tool nodes."""
+        graph = self._build_collision_graph()
+        assert graph.graph.has_node("Tool:filesystem_list_directory"), (
+            "Tool:filesystem_list_directory must be a graph node"
+        )
+        assert graph.graph.has_node("Tool:rugpull-test_list_directory"), (
+            "Tool:rugpull-test_list_directory must be a graph node"
+        )
+
+    def test_no_ghost_tool_node_in_graph(self):
+        """The unqualified Tool:list_directory ghost node must NOT exist."""
+        graph = self._build_collision_graph()
+        assert not graph.graph.has_node("Tool:list_directory"), (
+            "Ghost 'Tool:list_directory' node must be absent from the graph"
+        )
+
+    def test_tool_capabilities_have_correct_server_attribution(self):
+        graph = self._build_collision_graph()
+        fs_cap = graph.tool_capabilities["filesystem_list_directory"]
+        rp_cap = graph.tool_capabilities["rugpull-test_list_directory"]
+        assert fs_cap.server_name == "filesystem"
+        assert rp_cap.server_name == "rugpull-test"
+
+    def test_tool_capability_tool_name_matches_canonical_key(self):
+        """cap.tool_name must equal the dict key (canonical name)."""
+        graph = self._build_collision_graph()
+        for key, cap in graph.tool_capabilities.items():
+            assert cap.tool_name == key, (
+                f"tool_capabilities key '{key}' has cap.tool_name='{cap.tool_name}' -- mismatch"
+            )
+
+    def test_tool_count_equals_unique_exposed_names(self):
+        """Graph tool count must match the number of unique canonical tool names."""
+        graph = self._build_collision_graph()
+        # 3 tools total: filesystem_list_directory, rugpull-test_list_directory, read_file
+        assert len(graph.tool_capabilities) == 3, (
+            f"Expected 3 distinct tool capabilities, got {len(graph.tool_capabilities)}"
+        )
+
+    def test_unique_tool_is_not_namespaced(self):
+        """Tools that appear in only ONE server must keep their unqualified name."""
+        graph = self._build_collision_graph()
+        assert "read_file" in graph.tool_capabilities
+        assert "filesystem_read_file" not in graph.tool_capabilities
+
+    def test_agent_edges_target_canonical_tool_nodes(self):
+        """Agent must have CAN_CALL edges to both namespaced Tool nodes."""
+        graph = self._build_collision_graph()
+        agent_targets = {v for _, v in graph.graph.out_edges("Agent")}
+        assert "Tool:filesystem_list_directory" in agent_targets
+        assert "Tool:rugpull-test_list_directory" in agent_targets
+        assert "Tool:list_directory" not in agent_targets
+
+    def test_add_tool_namespaces_on_collision(self):
+        """add_tool must apply the same namespacing when a collision is detected."""
+        graph = CapabilityGraph()
+        graph.add_tool("filesystem", self.LIST_DIR_TOOL)
+        assert "list_directory" in graph.tool_capabilities
+
+        graph.add_tool("rugpull-test", self.LIST_DIR_TOOL)
+
+        assert "filesystem_list_directory" in graph.tool_capabilities
+        assert "rugpull-test_list_directory" in graph.tool_capabilities
+        assert "list_directory" not in graph.tool_capabilities
+
+    def test_add_tool_no_spurious_namespacing_for_unique_tools(self):
+        """add_tool must NOT namespace a tool that has no collision."""
+        graph = CapabilityGraph()
+        graph.add_tool("filesystem", self.EXTRA_UNIQUE_TOOL)
+        assert "read_file" in graph.tool_capabilities
+        assert "filesystem_read_file" not in graph.tool_capabilities
+
+
+# ---------------------------------------------------------------------------
+# TestCapabilitiesPersistence: Verify capabilities table persistence & refresh
+# ---------------------------------------------------------------------------
+
+class TestCapabilitiesPersistence:
+    """Verify that capabilities table is correctly populated and cleanly refreshed."""
+
+    @pytest.mark.asyncio
+    async def test_persist_tool_capabilities_populates_and_refreshes(self):
+        from sqlalchemy import text
+        from mcpath.backend.persistence.database import (
+            persist_tool_capabilities,
+            get_session_factory,
+        )
+
+        sample_caps = [
+            {
+                "tool_name": "filesystem_list_directory",
+                "server_name": "filesystem",
+                "data_target": "directory_contents",
+                "operation": "READ",
+                "action_type": "read_resource",
+                "external_destination": None,
+                "data_sensitivity": 1.0,
+                "action_sensitivity": 1.0,
+                "external_exposure": 0.0,
+                "policy_version": "1.0.0",
+                "raw_metadata": {"test": True},
+            },
+            {
+                "tool_name": "send_email",
+                "server_name": "email-server",
+                "data_target": "email_message",
+                "operation": "WRITE",
+                "action_type": "external_communication",
+                "external_destination": "external_recipient",
+                "data_sensitivity": 2.0,
+                "action_sensitivity": 3.0,
+                "external_exposure": 3.0,
+                "policy_version": "1.0.0",
+                "raw_metadata": {"simulated": True},
+            },
+        ]
+
+        # 1. First persistence pass: inserts 2 records
+        await persist_tool_capabilities(sample_caps)
+
+        factory = get_session_factory()
+        async with factory() as s:
+            res = await s.execute(text("SELECT tool_name, server_name, action, destination FROM capabilities ORDER BY tool_name"))
+            rows = res.fetchall()
+            assert len(rows) == 2, f"Expected 2 rows in capabilities, got {len(rows)}"
+            names = [r[0] for r in rows]
+            assert "filesystem_list_directory" in names
+            assert "send_email" in names
+
+        # 2. Second persistence pass with only 1 tool: must CLEAR old snapshot and refresh cleanly
+        single_cap = [sample_caps[1]]
+        await persist_tool_capabilities(single_cap)
+
+        async with factory() as s:
+            res = await s.execute(text("SELECT tool_name FROM capabilities"))
+            rows = res.fetchall()
+            assert len(rows) == 1, f"Expected 1 refreshed row in capabilities, got {len(rows)}"
+            assert rows[0][0] == "send_email"
