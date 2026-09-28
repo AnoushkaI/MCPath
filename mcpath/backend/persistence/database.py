@@ -690,23 +690,24 @@ async def persist_security_event(
                 )
                 s.add(stage_rec)
 
-                # Persist dedicated IntentEvaluationDB if this is Stage 3
+                # Persist dedicated IntentEvaluationDB if this is Stage 3 and was actually evaluated
                 if sr.get("stage_number") == 3 or sr.get("stage_name") == "Stage 3 - Intent Risk":
                     has_stage3 = True
                     meta = sr.get("metadata", {}) or {}
-                    intent_eval = IntentEvaluationDB(
-                        event_id=event_id,
-                        user_request=meta.get("user_request", event_dict.get("user_prompt")),
-                        tool_action=meta.get("tool_action", f"{tool_name}"),
-                        cosine_similarity=float(meta.get("cosine_similarity", 0.0)),
-                        intent_risk_score=float(sr.get("score") if sr.get("score") is not None else meta.get("intent_risk_score", 0.0)),
-                        similarity_threshold=float(meta.get("similarity_threshold", 0.70)),
-                        policy_version=str(meta.get("policy_version", "1.0.0")),
-                        classification=str(meta.get("classification", "LOW")),
-                        explanation=sr.get("explanation"),
-                        created_at=datetime.now(timezone.utc)
-                    )
-                    s.add(intent_eval)
+                    if meta.get("status") != "SKIPPED_NO_PROMPT" and meta.get("cosine_similarity") is not None:
+                        intent_eval = IntentEvaluationDB(
+                            event_id=event_id,
+                            user_request=meta.get("user_request", event_dict.get("user_prompt")),
+                            tool_action=meta.get("tool_action", f"{tool_name}"),
+                            cosine_similarity=float(meta.get("cosine_similarity", 0.0)),
+                            intent_risk_score=float(sr.get("score") if sr.get("score") is not None else meta.get("intent_risk_score", 0.0)),
+                            similarity_threshold=float(meta.get("similarity_threshold", 0.70)),
+                            policy_version=str(meta.get("policy_version", "1.0.0")),
+                            classification=str(meta.get("classification", "LOW")),
+                            explanation=sr.get("explanation"),
+                            created_at=datetime.now(timezone.utc)
+                        )
+                        s.add(intent_eval)
 
         # Fallback persistence for direct intent evaluation in event_dict if not already persisted from stage_results
         if not has_stage3 and event_dict.get("intent_evaluation"):

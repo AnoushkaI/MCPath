@@ -689,9 +689,10 @@ class CapabilityGraph:
                 })
                 return dc_replace(selected, metadata=meta)
 
-        # 3. If paths exist for this single tool, return the highest-risk compatible path
+        # 3. If paths exist for this tool, return the highest-risk compatible path
+        # to ensure fail-secure worst-case bounding under zero-trust policy.
         if paths:
-            # Sort by risk score descending
+            # Sort candidate paths by risk score descending
             sorted_paths = sorted(paths, key=lambda p: p.path_risk_score, reverse=True)
             selected = sorted_paths[0]
             if len(sorted_paths) > 1:

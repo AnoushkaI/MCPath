@@ -3,9 +3,9 @@
   "active_servers": [
     "filesystem",
     "git",
+    "postgres-mcp",
     "rugpull-test",
-    "email-server",
-    "postgres-mcp"
+    "email-server"
   ],
   "servers": {
     "sample_reference_server": {

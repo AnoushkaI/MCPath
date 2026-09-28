@@ -310,7 +310,7 @@ async def test_risk_engine_enforces_stage3_scores(intent_model):
 
 @pytest.mark.asyncio
 async def test_missing_user_prompt_handled_gracefully(intent_model):
-    """Missing or empty user prompt passes through safely with score 0.0."""
+    """Missing or empty user prompt explicitly skips Stage 3 with score None (N/A)."""
     stage3 = Stage3IntentRisk(model=intent_model)
 
     event = SecurityEventRecord(
@@ -328,9 +328,9 @@ async def test_missing_user_prompt_handled_gracefully(intent_model):
     result = await stage3.process_request(ctx)
     assert result.hard_block is False
     assert result.passed is True
-    assert result.score == 0.0
+    assert result.score is None
     assert result.metadata["status"] == "SKIPPED_NO_PROMPT"
-    assert ctx.event_record.scores.intent_risk == 0.0
+    assert ctx.event_record.scores.intent_risk is None
 
 
 @pytest.mark.asyncio

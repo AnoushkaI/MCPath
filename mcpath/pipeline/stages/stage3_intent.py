@@ -257,23 +257,24 @@ class Stage3IntentRisk(BasePipelineStage):
             server_name=context.server_name
         )
 
-        # If no user prompt is provided, pass through without penalizing
+        # If no user prompt is provided, explicitly skip Stage 3 without penalizing or treating as zero
         if not user_prompt or not str(user_prompt).strip():
-            explanation = "No user prompt provided; intent risk evaluation skipped (default low risk)"
-            context.event_record.scores.intent_risk = 0.0
+            explanation = "Stage 3 skipped: No natural-language user prompt provided (N/A)"
+            context.event_record.scores.intent_risk = None
             return StageResult(
                 stage_name=self.name,
-                score=0.0,
+                score=None,
                 hard_block=False,
                 passed=True,
                 explanation=explanation,
                 metadata={
                     "status": "SKIPPED_NO_PROMPT",
+                    "reason": "Missing natural-language user prompt (e.g. standard Claude Desktop MCP client invocation)",
                     "policy_version": self.policy_version,
                     "similarity_threshold": self.acceptable_similarity_threshold,
-                    "cosine_similarity": 1.0,
-                    "intent_risk_score": 0.0,
-                    "classification": "LOW",
+                    "cosine_similarity": None,
+                    "intent_risk_score": None,
+                    "classification": "N/A",
                     "user_request": None,
                     "tool_action": tool_action_text,
                     "evaluated_at": datetime.now(timezone.utc).isoformat()
@@ -301,6 +302,7 @@ class Stage3IntentRisk(BasePipelineStage):
         )
 
         metadata = {
+            "status": "EVALUATED",
             "policy_version": self.policy_version,
             "similarity_threshold": self.acceptable_similarity_threshold,
             "cosine_similarity": round(sim, 4),

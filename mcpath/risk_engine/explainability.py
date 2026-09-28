@@ -20,7 +20,12 @@ def format_explanation(event: SecurityEventRecord) -> str:
     observed_hash_str = event.observed_hash if event.observed_hash else "[NOT SET]"
 
     cap_str = f"{event.scores.capability_risk:.1f}" if event.scores.capability_risk is not None else "[NOT COMPUTED]"
-    intent_str = f"{event.scores.intent_risk:.1f}" if event.scores.intent_risk is not None else "[NOT COMPUTED]"
+    if event.scores.intent_risk is not None:
+        intent_str = f"{event.scores.intent_risk:.1f}"
+    elif not event.user_prompt or not str(event.user_prompt).strip():
+        intent_str = "N/A (SKIPPED_NO_PROMPT)"
+    else:
+        intent_str = "[NOT COMPUTED]"
     beh_str = f"{event.scores.behaviour_risk:.1f}" if event.scores.behaviour_risk is not None else "[NOT COMPUTED]"
     resp_str = f"{event.scores.response_risk:.1f}" if event.scores.response_risk is not None else "[NOT COMPUTED]"
 

@@ -229,7 +229,7 @@ async def test_standard_call_without_prompt_metadata_skipped_no_prompt():
     )
     result = await stage.process_request(ctx)
     assert result.passed is True
-    assert result.score == 0.0
+    assert result.score is None
     assert result.metadata["status"] == "SKIPPED_NO_PROMPT"
-    assert result.metadata["intent_risk_score"] == 0.0
+    assert result.metadata["intent_risk_score"] is None
     assert result.metadata["user_request"] is None

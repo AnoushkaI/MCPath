@@ -287,7 +287,25 @@ The pipeline evaluates every intercepted call in two deterministic phases:
     - `frontend/streamlit_app/pages/1_Security_Overview.py`: Updated server ratio indicator to `#94a3b8`.
     - `frontend/streamlit_app/pages/4_Risk_Analysis.py`: Replaced `#64748b` with `#94a3b8` for `NOT EXECUTED` and `NOT COMPUTED` status cards.
     - `frontend/streamlit_app/components/graph_viewer.py`: Enhanced edge label fonts with `#cbd5e1` and text strokes for graph topology clarity.
+- **2026-09-28 (Semi-Automated Evaluation System Across All 41 Configured MCP Tools)**:
+  - **Tool & Server Scope**:
+    - Discovered and categorized all 41 active MCP tools across the 5 configured downstream servers: `filesystem` (14 tools), `git` (12 tools), `postgres-mcp` (13 tools), `email-server` (1 tool), `rugpull-test` (1 tool).
+    - Preserved exact multi-server namespace resolution (e.g., `filesystem_list_directory` vs `rugpull-test_list_directory`).
+  - **Safe Sandbox Execution & Safeguards**:
+    - Implemented `EvaluationSandboxManager` creating a dedicated isolated temporary directory (`temp_eval_sandbox`), populating dummy test files (`readme.txt`, `config.json`, `output.log`, `customers.csv`, `sample.png`), and restoring pristine state in a `finally` block.
+    - Categorized tools into `SAFE_AUTOMATED` (read/metadata/isolated sandbox) and `MANUAL_REVIEW_SAFEGUARDED` (mutating/destructive actions). Destructive tests strictly target temporary sandbox files and never touch real repository assets or send real network emails.
+  - **Comprehensive Evaluation Pipeline (`mcpath/evaluation/`)**:
+    - `models.py`: Defined `ScenarioDefinition`, `ScenarioExecutionResult`, `StageOutcome`, `OutcomeVerdict` (`PASS`, `FALSE_POSITIVE`, `FALSE_NEGATIVE`, `EXECUTION_FAILURE`), `SafetyClassification`, and `ClaudeDesktopManualStatus`.
+    - `scenarios.py`: Created 46 declarative evaluation scenarios covering all 41 tools, harmless operations, dangerous operations, intent mismatches, and cross-tool exfiltration chains.
+    - `runner.py`: Implemented `EvaluationRunner` managing sandbox lifecycle, executing tool calls through the live MCPath proxy (`create_proxy_server`) and 6-stage pipeline (`PipelineRunner`), comparing expected vs actual decisions, and attributing discrepancies to contributing stages.
+    - `reporter.py`: Generates `evaluation/results.json`, `evaluation/report.csv`, and a readable `evaluation/report.md` with tool-wise, server-wise, and stage-wise breakdowns.
+  - **Empirical Metrics & [TO BE MEASURED] Policy**:
+    - Measured empirical metrics strictly from observed counts: Precision, Recall, F1, False Positive Rate (FPR), False Negative Rate (FNR), and Block Latency.
+    - Unimplemented/stubbed stages (Stage 4 Behaviour Deviation, Stage 5 Response Risk) are explicitly preserved as `[TO BE MEASURED]`.
+  - **Claude Desktop Manual Review Separation**:
+    - Distinguishes automated programmatic proxy evaluations from interactive Claude Desktop conversations (`VERIFIED_MANUALLY`, `PENDING_MANUAL_REVIEW`, `NOT_APPLICABLE_SYSTEM_LEVEL`).
   - **Testing & Verification**:
-    - Executed automated tests: `pytest tests/test_streamlit_frontend.py` (3 passed).
-    - Executed live visual browser subagent audit across all 7 dashboard pages (`http://localhost:8501`), capturing full-page screenshots and recordings. Confirmed 100% readability without hovering across all components.
+    - Added focused tests in `tests/test_evaluation_system.py` (5 passed in 0.42s).
+    - Executed `run_evaluation.py` CLI across all 46 scenarios generating complete report artifacts in `evaluation/`.
+    - Executed full test suite: **114 passed** across the entire repository (100% pass).
 

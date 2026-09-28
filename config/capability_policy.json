@@ -49,6 +49,16 @@
     "require_consumed_data_match": true
   },
   "explicit_tool_rules": {
+    "list_allowed_directories": {
+      "data_target": "allowed_directories_list",
+      "operation": "READ",
+      "action_type": "inspect_configuration",
+      "data_sensitivity": 0.5,
+      "action_sensitivity": 0.5,
+      "external_exposure": 0.0,
+      "external_destination": null,
+      "consumed_data_types": ["allowed_directories_list"]
+    },
     "read_customer": {
       "data_target": "customer_pii",
       "operation": "READ",
@@ -310,14 +320,14 @@
       "consumed_data_types": ["git_repository"]
     },
     "postgres_mcp_db_context": {
-      "data_target": "database_records",
+      "data_target": "database_metadata",
       "operation": "READ",
-      "action_type": "inspect_database",
-      "data_sensitivity": 2.0,
-      "action_sensitivity": 1.0,
+      "action_type": "inspect_database_metadata",
+      "data_sensitivity": 1.0,
+      "action_sensitivity": 0.5,
       "external_exposure": 0.0,
       "external_destination": null,
-      "consumed_data_types": ["database_records"]
+      "consumed_data_types": ["database_metadata"]
     },
     "postgres_mcp_query": {
       "data_target": "database_records",

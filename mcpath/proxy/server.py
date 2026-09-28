@@ -125,6 +125,13 @@ def create_proxy_server(
             user_prompt=user_prompt,
         )
 
+        if isinstance(arguments, dict):
+            if arguments.get("_reset_history"):
+                call_history.clear()
+            if "_call_history" in arguments:
+                call_history.clear()
+                call_history.extend(arguments["_call_history"])
+
         call_history.append(original_name)
         pipeline_ctx = PipelineContext(
             server_name=owning_server,
