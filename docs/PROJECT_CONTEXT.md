@@ -270,5 +270,24 @@ The pipeline evaluates every intercepted call in two deterministic phases:
   - **Inferred Capability Modeling**: Preserved strict separation of policy from code; `send_email` capabilities are inferred dynamically via `CapabilityClassifier` from manifest definitions matching `config/capability_policy.json` (`email_outbox`, `external_communication`, `external_recipient`).
   - **Causal Exfiltration Path Recognition**: Enables `CapabilityGraph` to construct `Resource:filesystem_data -> Action:send_email:external_communication -> Destination:external_recipient`, triggering the Critical Path Override (score >= 85.0, classification HIGH) when sensitive data flows to external communication.
   - **Isolated Action Representation**: Verified that isolated email actions do not trigger critical path overrides unless sensitive data is attached.
-  - **Automated Verification**: Added `tests/test_mock_email_server.py` with 7 comprehensive tests; total repository automated test suite elevated to **57 passing automated tests** (100% pass).
+- **2026-09-28 (Streamlit Dashboard UI Text Visibility & High-Contrast Dark Theme Fixes)**:
+  - **Root Cause Resolution**:
+    - Discovered that Streamlit was running without `.streamlit/config.toml`, defaulting internally to light theme tokens (`--text-color: #31333F; --background-color: #ffffff;`). Combined with `.stApp { background-color: #0b0f19; }`, this caused dark charcoal text to render on a near-black background, becoming readable only on hover.
+    - Created `.streamlit/config.toml` enforcing `base="dark"`, `primaryColor="#00f0ff"`, `backgroundColor="#0b0f19"`, `secondaryBackgroundColor="#111827"`, and `textColor="#f1f5f9"`.
+  - **Centralized Design System (`frontend/streamlit_app/styles.py`)**:
+    - Centralized all color contrast and component styling rules in `SOC_CSS` without altering any dashboard layout, routing, backend APIs, or risk calculations.
+    - Standardized palette: Primary text `#f8fafc` (~15:1 contrast against `#0b0f19`, WCAG AAA), Secondary text `#cbd5e1` (~10:1), Muted labels/subtext `#94a3b8` (~6.5:1, WCAG AA, replacing low-contrast `#64748b`), Interactive accent cyan `#00f0ff` (~12.5:1).
+    - Sidebar Navigation: Overrode Streamlit 1.35+ `[data-testid="stSidebarNavLink"]` with `#e2e8f0` normal text, `#00f0ff` active text with cyan background pill, and `#ffffff` hover.
+    - Buttons: Styled `.stButton > button`, secondary, primary, and download buttons with distinct `#1e293b` backgrounds, `#334155` borders, and high-contrast `#f8fafc` text in normal state.
+    - Dropdowns & Form Inputs: Styled BaseWeb selectboxes, popovers, radio buttons, checkboxes, text inputs, and textareas with `#f8fafc` text and `#111827` backgrounds.
+    - Tables & DataFrames: Added explicit `#111827` background, `#1e293b` headers, and `#e2e8f0` cell text.
+    - Expanders & Tabs: Ensured summaries, active tabs (`#00f0ff`), and inactive tabs (`#94a3b8`) are crisp and legible.
+  - **Component & Page Enhancements**:
+    - `frontend/streamlit_app/app.py`: Updated sidebar footer active pipeline text to `#f8fafc` / `#cbd5e1` / `#94a3b8`.
+    - `frontend/streamlit_app/pages/1_Security_Overview.py`: Updated server ratio indicator to `#94a3b8`.
+    - `frontend/streamlit_app/pages/4_Risk_Analysis.py`: Replaced `#64748b` with `#94a3b8` for `NOT EXECUTED` and `NOT COMPUTED` status cards.
+    - `frontend/streamlit_app/components/graph_viewer.py`: Enhanced edge label fonts with `#cbd5e1` and text strokes for graph topology clarity.
+  - **Testing & Verification**:
+    - Executed automated tests: `pytest tests/test_streamlit_frontend.py` (3 passed).
+    - Executed live visual browser subagent audit across all 7 dashboard pages (`http://localhost:8501`), capturing full-page screenshots and recordings. Confirmed 100% readability without hovering across all components.
 

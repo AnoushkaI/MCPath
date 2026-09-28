@@ -1,0 +1,392 @@
+# MCPath — Project Context
+
+> Last updated: 2026-09-24 (after commit `1c9e5d0` — *intent risk feature implemented*)
+
+---
+
+## 1. What Is MCPath?
+
+**MCPath** is a zero-trust, in-line security proxy that intercepts every call between an MCP client (e.g. Claude Desktop) and one or more downstream MCP servers. It enforces a 6-stage sequential risk pipeline and makes deterministic ALLOW / HOLD / BLOCK decisions before any tool call reaches the downstream server.
+
+**Core principle:** No tool call is forwarded unless it passes every active pipeline stage and the deterministic Risk Engine permits it.
+
+---
+
+## 2. Repository Layout
+
+```
+c:\projects\mcp proxy\
+│
+├── config/
+│   ├── server_config.json          # Source of truth for active MCP servers
+│   ├── capability_policy.json      # Stage 2 capability scoring policy
+│   └── intent_policy.json          # Stage 3 intent risk policy
+│
+├── mcpath/
+│   ├── config/settings.py          # Pydantic settings, SERVER_CONFIG loading
+│   ├── core/exceptions.py
+│   │
+│   ├── proxy/
+│   │   ├── server.py               # MCP lowlevel Server — intercept & route
+│   │   ├── client_manager.py       # DownstreamClientManager — multi-server sessions
+│   │   └── control.py              # IPC control channel to running proxy
+│   │
+│   ├── pipeline/
+│   │   ├── stage.py                # PipelineContext, StageResult, BasePipelineStage
+│   │   ├── pipeline_runner.py      # PipelineRunner — orchestrates Stages 1-5 + Risk Engine
+│   │   └── stages/
+│   │       ├── stage1_hash.py      # Stage 1: Tool Integrity Hash Check (HARD GATE)
+│   │       ├── stage2_capability.py# Stage 2: Capability Graph Risk (scored)
+│   │       ├── stage3_intent.py    # Stage 3: Semantic Intent Risk (IMPLEMENTED)
+│   │       ├── stage4_behaviour.py # Stage 4: Behaviour Deviation (stub)
+│   │       └── stage5_response.py  # Stage 5: Response Risk (stub)
+│   │
+│   ├── graph/
+│   │   ├── capability_graph.py     # CapabilityGraph — typed-edge graph, path scoring
+│   │   └── capability_inference.py # Tool-to-capability inference from schema + policy
+│   │
+│   ├── risk_engine/
+│   │   ├── engine.py               # RiskEngine — deterministic ALLOW/HOLD/BLOCK
+│   │   ├── models.py               # EnforcementDecision, RiskScores, SecurityEventRecord
+│   │   └── explainability.py
+│   │
+│   └── backend/
+│       ├── app.py                  # FastAPI app, router registration
+│       ├── persistence/
+│       │   ├── models.py           # SQLAlchemy ORM models (8 tables)
+│       │   ├── database.py         # Async DB functions, session factory
+│       │   └── __init__.py
+│       └── routes/
+│           ├── servers.py          # /api/servers — full CRUD + lifecycle
+│           ├── hashes.py           # /api/hashes
+│           ├── capabilities.py     # /api/capabilities
+│           ├── events.py           # /api/events
+│           ├── stage_results.py    # /api/stage-results
+│           └── overview.py         # /api/overview
+│
+├── tests/                          # 88+ tests (all passing)
+│   ├── test_stage3_intent.py       # 12 Stage 3 intent risk tests (NEW)
+│   └── ... (11 other test files)
+│
+├── mock_servers/
+│   ├── rugpullserver.py            # Simulates rug-pull attack
+│   ├── email_server.py
+│   └── sample_server.py
+│
+├── run_proxy.py                    # Entry: MCP stdio proxy
+├── requirements.txt
+└── .env
+```
+
+---
+
+## 3. Active MCP Servers (`config/server_config.json`)
+
+`active_servers` is the source of truth. `ServerDB.is_active` in PostgreSQL is synchronized to match on every `POST /api/servers/reload`.
+
+| Server | Command | In active_servers |
+|---|---|---|
+| `filesystem` | `npx @modelcontextprotocol/server-filesystem` | YES |
+| `git` | `uvx mcp-server-git` | YES |
+| `rugpull-test` | `python mock_servers/rugpullserver.py` | YES |
+| `email-server` | `python mock_servers/email_server.py` | YES |
+| `postgres-mcp` | `npx @microsoft/postgres-mcp@latest run` | NO |
+| `sample_reference_server` | `python mock_servers/sample_server.py` | NO |
+| `manual-test-server` | `.venv python sample_server.py` | NO |
+
+---
+
+## 4. The 6-Stage Security Pipeline
+
+### Stage 1 — Tool Integrity Hash Check (HARD GATE)
+**File:** `mcpath/pipeline/stages/stage1_hash.py`
+
+- Extracts security-relevant fields (`name`, `description`, `inputSchema`) from the tool definition
+- Canonicalizes with recursively sorted keys → SHA-256 hash
+- Compares against active approved baseline in `approved_hashes` PostgreSQL table
+- **NO_APPROVED_BASELINE** → `hard_block=True`, BLOCK (fail-closed)
+- **HASH_MISMATCH** → `hard_block=True`, BLOCK (rug-pull detected)
+- **MATCH** → `passed=True`, continue pipeline
+
+**Trust registration:** `POST /api/servers/{name}/trust` → `register_trusted_server_and_tools()` → stores `ApprovedHashDB` rows.
+
+### Stage 2 — Capability Risk (Scored 0–100)
+**Files:** `mcpath/graph/capability_graph.py`, `mcpath/graph/capability_inference.py`, `mcpath/pipeline/stages/stage2_capability.py`
+
+**Graph node types:**
+- `Agent` — the MCP client
+- `Tool:{tool_name}` — canonical tool node (one per discovered tool)
+- `Resource:R` — data resource type
+- `Action:T:A` — action performed by tool T
+- `Destination:D` — external destination
+
+**Edge types:** `CAN_CALL`, `ACCESSES`, `PERFORMS`, `FLOWS_TO` (evidence-gated), `EXPOSES_TO`
+
+**Path scoring formula:**
+```
+path_risk_score = data_sensitivity × 0.35
+                + action_sensitivity × 0.40
+                + external_exposure × 0.15
+                + chain_risk × 0.10
+```
+
+**Critical-path override:** `Sensitive Data → External Action → External Destination` → forces HIGH regardless of numeric score.
+
+**FLOWS_TO edge rule:** Created only when `explicit_tool_rules.consumed_data_types` contains the resource type, OR an explicit compatibility rule permits it. Never created merely because tools share a server.
+
+**Canonical tool node IDs:** `Tool:{tool_name}` everywhere — one node, one `CAN_CALL` edge per tool.
+
+### Stage 3 — Semantic Intent Risk (Scored 0–100) — IMPLEMENTED
+**File:** `mcpath/pipeline/stages/stage3_intent.py`
+
+Compares **USER INTENT ↔ ACTUAL ACTION** using cosine similarity between sentence embeddings.
+
+**Model:** `all-MiniLM-L6-v2` (sentence-transformers), loaded once as a thread-safe singleton.
+
+**Key insight — semantic action representation:**
+Instead of comparing the user prompt against the full verbose MCP tool description, `build_tool_action_text()` produces a **concise action representation**:
+1. `tool_name` snake_case → natural phrase (e.g. `list_directory` → `list directory`)
+2. Prepend server domain context (e.g. `filesystem list directory`)
+3. Append only the **first sentence** of description via `extract_primary_action()`
+4. Result: `"filesystem list directory. Get a detailed listing of all files and directories in a specified path."`
+
+This raises similarity from 0.57 (with full verbose docs) to 0.76 for a matching filesystem request.
+
+**Scoring formula (linear-inverted):**
+```
+score = (1 - cosine_similarity) × 100   [clamped 0–100]
+```
+High similarity → low risk score.
+
+**Classification:**
+- `< 30.0` → LOW
+- `30.0–70.0` → MEDIUM
+- `≥ 70.0` → HIGH
+
+**Stage 3 never independently blocks.** `hard_block` is always `False`. The Risk Engine is the sole enforcement authority.
+
+**Validated scenarios:**
+| User Request | Tool Action | Similarity | Risk Score | Tier |
+|---|---|---|---|---|
+| "List the files in my allowed filesystem directory." | filesystem list_directory | 0.7603 | 23.97 | LOW/ALLOW |
+| "Read lines from notes.txt" | filesystem read_file | 0.5068 | 49.32 | MEDIUM |
+| "Summarize my latest ticket." | "export all customer records." | 0.1006 | 89.94 | HIGH/BLOCK |
+
+**Policy config:** `config/intent_policy.json` — model name, thresholds, scoring bounds, level boundaries. All configurable, none hardcoded in scattered logic.
+
+### Stage 4 — Behaviour Deviation (Stub)
+Placeholder. Returns `score=0.0`, `passed=True`. Intended for behavioral baseline comparison (Day 9+).
+
+### Stage 5 — Response Risk (Stub)
+Placeholder. Returns `score=0.0`, `passed=True`. Runs post-execution in `PipelineRunner.run_post_call()`.
+
+### Stage 6 — Risk Engine (Deterministic Enforcer)
+**File:** `mcpath/risk_engine/engine.py`
+
+```
+RiskEngine(low_threshold=30.0, high_threshold=70.0)
+
+1. hash_matched is False → BLOCK (hard gate, bypasses scores)
+2. max(capability_risk, intent_risk, behaviour_risk, response_risk)
+   >= 70.0 → BLOCK
+   >= 30.0 → HOLD
+   else    → ALLOW
+```
+
+The Risk Engine is the **only** component that issues enforcement decisions.
+
+---
+
+## 5. Pipeline Execution Flow
+
+```
+tools/call intercepted by MCP proxy server
+  ↓
+PipelineRunner.run_pre_call(context)
+  ├── Stage 1 (hash check) — HARD GATE
+  │     hard_block=True → BLOCK immediately, persist, return
+  ├── Stage 2 (capability risk) → scores.capability_risk
+  ├── Stage 3 (intent risk)     → scores.intent_risk
+  ├── Stage 4 (behaviour)       → scores.behaviour_risk
+  └── Risk Engine pre-call evaluation
+        BLOCK → persist + return blocked response
+        HOLD/ALLOW → continue
+
+  ↓ ALLOW only
+  Downstream MCP server call
+
+  ↓
+PipelineRunner.run_post_call(context)
+  ├── Stage 5 (response risk)   → scores.response_risk
+  └── Risk Engine final evaluation
+        Persist SecurityEventDB + StageResultDB + DecisionDB + IntentEvaluationDB
+```
+
+Terminal `🚨 MCPath SECURITY BLOCK` alert printed to `stderr` on any BLOCK decision.
+
+---
+
+## 6. PostgreSQL Persistence Layer
+
+**Dual DB support:** PostgreSQL (`asyncpg`) for production, SQLite (`aiosqlite`) for testing.
+
+### ORM Tables (`mcpath/backend/persistence/models.py`)
+
+| Table | Purpose |
+|---|---|
+| `servers` | `ServerDB` — server registry, `is_active`, `trust_status` |
+| `tools` | `ToolDB` — discovered tool definitions |
+| `approved_hashes` | `ApprovedHashDB` — Stage 1 baselines |
+| `capabilities` | `CapabilityDB` — Stage 2 capability mappings |
+| `capability_nodes` | `CapabilityNodeDB` — graph nodes |
+| `capability_edges` | `CapabilityEdgeDB` — graph typed edges |
+| `capability_paths` | `CapabilityPathDB` — scored enumerated paths |
+| `baseline_traces` | `BaselineTraceDB` — Stage 4 behavioral traces (placeholder) |
+| `security_events` | `SecurityEventDB` — full audit log |
+| `stage_results` | `StageResultDB` — per-stage evaluation per event |
+| `decisions` | `DecisionDB` — Risk Engine enforcement record |
+| `intent_evaluations` | `IntentEvaluationDB` — Stage 3 cosine sim + risk score per event |
+
+### Key DB Functions
+
+| Function | Purpose |
+|---|---|
+| `init_db()` | Create all tables |
+| `register_server()` | Upsert `ServerDB` |
+| `register_trusted_server_and_tools()` | Full trust flow: server + tools + approved hashes |
+| `get_approved_hash(server_name, tool_name)` | Active SHA-256 for Stage 1 |
+| `persist_security_event(event_dict, stage_results)` | Atomic write of all audit tables |
+| `get_intent_evaluation(event_id)` | Retrieve Stage 3 details |
+| `set_server_active_state(server_name, is_active)` | Toggle `ServerDB.is_active` |
+| `reconcile_server_active_states(active_servers, configured_servers, session)` | Sync all `is_active` flags on reload |
+| `get_server_db_status(server_name, session)` | Server + tool counts for API |
+
+### Server State Synchronization
+
+- `POST /api/servers/reload` calls `reconcile_server_active_states()`:
+  - Servers in `active_servers ∩ config.servers` → `is_active=True`
+  - All others → `is_active=False`
+- **No rows are ever deleted** — historical baselines, tools, hashes, events preserved permanently
+- A restored server regains `is_active=True` on next reload
+
+---
+
+## 7. Server Lifecycle API
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/api/servers` | GET | All server statuses (live proxy → DB fallback) |
+| `/api/servers/{name}` | GET | Single server status |
+| `/api/servers/{name}/tools` | GET | Discovered tools for server |
+| `/api/servers/add` | POST | Connect + discover (UNTRUSTED, no baseline) |
+| `/api/servers/{name}/trust` | POST | Create Stage 1 approved baseline for all tools |
+| `/api/servers/{name}/deactivate` | POST | Disconnect, `is_active=False`, remove from catalog |
+| `/api/servers/{name}/activate` | POST | Reconnect, `is_active=True` (no new baseline) |
+| `/api/servers/reload` | POST | Reload config, sync DB, reconnect/disconnect |
+| `/api/servers/switch` | POST | Switch `active_server` (legacy) |
+
+Other APIs: `/api/hashes`, `/api/capabilities`, `/api/capabilities/graph`, `/api/events`, `/api/stage-results`, `/api/overview`.
+
+---
+
+## 8. Data Models
+
+### `PipelineContext`
+```python
+server_name: str
+tool_name: str
+arguments: Dict[str, Any]
+user_prompt: Optional[str]
+tool_definition: Optional[Dict[str, Any]]   # Full MCP tool definition
+tool_response: Optional[Any]
+call_history: list[str]
+event_record: SecurityEventRecord
+```
+
+### `SecurityEventRecord`
+```python
+event_id, timestamp, server_name, tool_name, arguments, user_prompt
+expected_hash, observed_hash, hash_matched      # Stage 1 outputs
+scores: RiskScores                               # capability/intent/behaviour/response
+decision: EnforcementDecision                    # ALLOW | HOLD | BLOCK
+reason, hard_gate_triggered, action_taken
+is_error, result_content
+```
+
+---
+
+## 9. Configuration Files
+
+| File | Purpose |
+|---|---|
+| `config/server_config.json` | MCP server definitions and `active_servers` list |
+| `config/capability_policy.json` | Per-tool capability inference rules (data/action sensitivity, destinations, compatibility rules) |
+| `config/intent_policy.json` | Stage 3 model, thresholds, scoring formula, level boundaries |
+| `.env` | `DATABASE_URL`, `FILESYSTEM_ALLOWED_PATHS`, `GIT_REPOSITORY_PATH`, `POSTGRES_MCP_CONNECTION_STRING` |
+
+---
+
+## 10. Running the Project
+
+```powershell
+# MCP stdio proxy (Claude Desktop)
+.\.venv\Scripts\python.exe run_proxy.py
+
+# FastAPI backend
+.\.venv\Scripts\python.exe -m uvicorn mcpath.backend.app:app --host 127.0.0.1 --port 8000
+
+# Trust & register a server
+.\.venv\Scripts\python.exe run_register.py --server filesystem
+
+# Run Stage 3 tests only
+.\.venv\Scripts\python.exe -m pytest tests/test_stage3_intent.py -v
+
+# Run full test suite
+.\.venv\Scripts\python.exe -m pytest -v
+```
+
+---
+
+## 11. Test Suite (88+ tests, all passing)
+
+| File | Count | Covers |
+|---|---|---|
+| `test_passthrough.py` | — | Basic proxy passthrough |
+| `test_pipeline_skeleton.py` | — | PipelineRunner wiring |
+| `test_backend_skeleton.py` | — | FastAPI route structure |
+| `test_stage1_hash.py` | 13 | Hash functions, rug-pull, NO_APPROVED_BASELINE |
+| `test_stage1_end_to_end.py` | — | Stage 1 full pipeline integration |
+| `test_capability_graph.py` | 35+ | Graph nodes/edges, path scoring, critical-path override, canonical IDs, FLOWS_TO rules |
+| `test_multi_server_proxy.py` | — | Multi-server routing, namespacing |
+| `test_mock_email_server.py` | — | Email server integration |
+| `test_server_reload_lifecycle.py` | — | Reload, `active_servers` synchronization |
+| `test_server_state_sync.py` | — | `reconcile_server_active_states`, add/deactivate/activate |
+| `test_dynamic_server_management.py` | — | Dynamic server management API |
+| `test_stage3_intent.py` | **12** | Model singleton, `build_tool_action_text`, LOW/MEDIUM/HIGH scenarios, Risk Engine enforcement, PostgreSQL persistence, end-to-end pipeline |
+
+---
+
+## 12. Git History
+
+| Commit | Message |
+|---|---|
+| `1c9e5d0` | intent risk feature implemented |
+| `92b19c8` | dynamic server switching, adding, deactivating |
+| `b905fe1` | MCPath Day 3 capability stage complete |
+| `babd918` | multi-server connector setup, rugpull blocked |
+| `0237b4d` | Cleanup and added Microsoft postgres-mcp |
+| `e466c86` | tool discovery and approved baseline |
+| `0e9a774` | Day 2: Stage 1 Hash matching |
+| `cd93679` | Day 1: MCP proxy passthrough milestone |
+
+---
+
+## 13. What Is NOT Yet Implemented
+
+| Feature | Status |
+|---|---|
+| Stage 4 — Behaviour Deviation | Stub. Returns score=0.0. No baseline comparison yet. |
+| Stage 5 — Response Risk | Stub. Returns score=0.0. No content inspection yet. |
+| Streamlit dashboard | `frontend/streamlit_app` fully operational with high-contrast Zero-Trust SOC dark theme |
+| Alembic migrations | In requirements, not yet configured |
+| SSE/HTTP MCP transport | Stdio only currently |

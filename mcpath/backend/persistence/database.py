@@ -116,7 +116,11 @@ async def init_db(engine_instance=None) -> None:
                     "ALTER TABLE capabilities ADD COLUMN IF NOT EXISTS metadata_json JSON DEFAULT '{}'",
                     "ALTER TABLE servers ADD COLUMN IF NOT EXISTS trust_status VARCHAR(20) DEFAULT 'UNTRUSTED'",
                     "ALTER TABLE servers ADD COLUMN IF NOT EXISTS last_discovery_time TIMESTAMP WITH TIME ZONE",
-                    "ALTER TABLE servers ADD COLUMN IF NOT EXISTS last_trust_time TIMESTAMP WITH TIME ZONE"
+                    "ALTER TABLE servers ADD COLUMN IF NOT EXISTS last_trust_time TIMESTAMP WITH TIME ZONE",
+                    "ALTER TABLE capability_paths ADD COLUMN IF NOT EXISTS path_id VARCHAR(64)",
+                    "ALTER TABLE security_events ADD COLUMN IF NOT EXISTS runtime_path_id VARCHAR(64)",
+                    "ALTER TABLE security_events ADD COLUMN IF NOT EXISTS matched_path BOOLEAN",
+                    "ALTER TABLE security_events ADD COLUMN IF NOT EXISTS match_status VARCHAR(30)"
                 ]:
                     try:
                         await conn.execute(text(col_stmt))
@@ -126,7 +130,11 @@ async def init_db(engine_instance=None) -> None:
                 for col_stmt in [
                     "ALTER TABLE servers ADD COLUMN trust_status VARCHAR(20) DEFAULT 'UNTRUSTED'",
                     "ALTER TABLE servers ADD COLUMN last_discovery_time TIMESTAMP",
-                    "ALTER TABLE servers ADD COLUMN last_trust_time TIMESTAMP"
+                    "ALTER TABLE servers ADD COLUMN last_trust_time TIMESTAMP",
+                    "ALTER TABLE capability_paths ADD COLUMN path_id VARCHAR(64)",
+                    "ALTER TABLE security_events ADD COLUMN runtime_path_id VARCHAR(64)",
+                    "ALTER TABLE security_events ADD COLUMN matched_path BOOLEAN",
+                    "ALTER TABLE security_events ADD COLUMN match_status VARCHAR(30)"
                 ]:
                     try:
                         await conn.execute(text(col_stmt))
@@ -651,6 +659,9 @@ async def persist_security_event(
             expected_hash=event_dict.get("expected_hash"),
             observed_hash=event_dict.get("observed_hash"),
             hash_matched=event_dict.get("hash_matched"),
+            runtime_path_id=event_dict.get("runtime_path_id"),
+            matched_path=event_dict.get("matched_path"),
+            match_status=event_dict.get("match_status"),
             capability_risk=cap_risk,
             intent_risk=int_risk,
             behaviour_risk=beh_risk,
@@ -815,7 +826,13 @@ async def persist_capability_graph(
                     tool_name = n.split("Tool:", 1)[1]
                     break
 
+            path_id = path.get("path_id")
+            if not path_id and path_nodes:
+                from mcpath.graph.capability_graph import generate_path_id
+                path_id = generate_path_id(path_nodes)
+
             path_rec = CapabilityPathDB(
+                path_id=path_id,
                 tool_name=tool_name,
                 path_nodes=path_nodes,
                 path_edges=path.get("path_edges", []),
@@ -934,6 +951,7 @@ async def get_persisted_capability_paths(
         return [
             {
                 "id": p.id,
+                "path_id": p.path_id or f"path_{p.tool_name}_{p.id}",
                 "tool_name": p.tool_name,
                 "path_nodes": p.path_nodes,
                 "path_edges": p.path_edges,

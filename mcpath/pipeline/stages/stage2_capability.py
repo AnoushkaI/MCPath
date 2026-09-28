@@ -50,6 +50,27 @@ class Stage2CapabilityRisk(BasePipelineStage):
         # Produce capability result for Risk Engine evaluation
         context.event_record.scores.capability_risk = result.path_risk_score
 
+        # Runtime matching identification fields
+        runtime_path_id = result.metadata.get("runtime_path_id") or result.path_id
+        matched_path = result.metadata.get("matched_path", bool(result.path_id))
+        match_status = result.metadata.get("match_status", "MATCHED" if matched_path else "UNKNOWN")
+        selection_reason = result.metadata.get("selection_reason", "")
+
+        context.event_record.runtime_path_id = runtime_path_id
+        context.event_record.matched_path = matched_path
+        context.event_record.match_status = match_status
+
+        logger.info(
+            "Capability runtime evaluation: tool_name=%s matched_path=%s match_status=%s runtime_path_id=%s risk_score=%.1f classification=%s selection_reason=%s",
+            tool_name,
+            matched_path,
+            match_status,
+            runtime_path_id,
+            result.path_risk_score,
+            result.classification,
+            selection_reason
+        )
+
         # Collect all candidate paths for this tool to include in metadata
         all_candidate_paths = [
             p.to_dict() for p in self.graph.get_paths_for_tool(tool_name)
@@ -57,6 +78,11 @@ class Stage2CapabilityRisk(BasePipelineStage):
 
         metadata = {
             "policy_version": result.policy_version,
+            "path_id": result.path_id,
+            "runtime_path_id": runtime_path_id,
+            "matched_path": matched_path,
+            "match_status": match_status,
+            "selection_reason": selection_reason,
             "path_nodes": result.path_nodes,
             "path_edges": result.path_edges,
             "data_sensitivity": result.data_sensitivity,

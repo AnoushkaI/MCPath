@@ -34,6 +34,11 @@ class SecurityEventRecord(BaseModel):
     observed_hash: Optional[str] = None
     hash_matched: Optional[bool] = None
 
+    # Stage 2 Capability Path matching details
+    runtime_path_id: Optional[str] = None
+    matched_path: Optional[bool] = None
+    match_status: Optional[str] = None  # MATCHED, UNKNOWN, UNMODELED
+
     # Graded scores (Stages 2-5)
     scores: RiskScores = Field(default_factory=RiskScores)
 

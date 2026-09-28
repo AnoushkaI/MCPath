@@ -254,11 +254,29 @@ class CapabilityClassifier:
 
         # -------------------------------------------------------------------
         # Dimension C: Data Target & Data Sensitivity
-        # Priority: high-severity sensitive patterns -> server context -> general patterns -> fallback
+        # Priority: high-severity sensitive patterns -> metadata/profile evidence -> 
+        #           concrete database record evidence -> server context -> general patterns -> fallback
         # -------------------------------------------------------------------
         sens_rules = patterns.get("sensitive_data_patterns", [])
         data_sensitivity = float(defaults.get("data_sensitivity", 0.0))
         data_target = defaults.get("data_target", "generic_resource")
+
+        # Helper: detect metadata, profile, diagnostic, or capabilities evidence
+        metadata_pat = r"(?i)\b(metadata|profile|profiles|connection_profile|connection_profiles|capabilities|server_capabilities|catalog|diagnostic|diagnostics|version|db_context)\b"
+        has_metadata_evidence = bool(
+            re.search(metadata_pat, clean_name)
+            or re.search(metadata_pat, description)
+            or re.search(metadata_pat, prop_names)
+        )
+
+        # Helper: detect concrete database record manipulation / query execution evidence
+        # Words such as database, query, table, or record alone are insufficient evidence.
+        record_op_pat = r"(?i)\b(sql_query|execute_query|query_database|modify_database|bulk_load|table_rows|table_data|database_records|database_data|select\s+from|insert\s+into|update\s+set|delete\s+from)\b"
+        has_record_evidence = bool(
+            re.search(record_op_pat, clean_name)
+            or re.search(record_op_pat, description)
+            or any(k in schema_props for k in ("sql", "query", "statement", "sql_query"))
+        )
 
         # 1. High-severity sensitive data check (PII, credentials, secrets, financial/customer records)
         high_sens_rules = [
@@ -277,41 +295,67 @@ class CapabilityClassifier:
             src = "description" if self._word_match(rule.get("pattern", ""), description) else ("schema" if self._word_match(rule.get("pattern", ""), prop_names) else "name")
             evidence["data_target"] = {"source": src, "matched": matched_str}
             evidence["data_sensitivity"] = {"source": src, "matched": matched_str}
-        else:
-            # 2. Check server context for native resource target
-            s_lower = server_name.lower()
-            if s_lower in ("postgres-mcp", "postgres"):
+        elif has_metadata_evidence:
+            # Metadata/profile tools must not be classified as database_records even if words
+            # like 'database', 'table', 'record', or 'query' appear as context.
+            data_target = "database_metadata" if server_name.lower() in ("postgres-mcp", "postgres", "sqlite") or "database" in description.lower() else "generic_metadata"
+            data_sensitivity = 1.0
+            evidence["data_target"] = {"source": "metadata_inference", "matched": clean_name or "metadata"}
+            evidence["data_sensitivity"] = {"source": "metadata_inference", "matched": "1.0"}
+            if action_type in ("internal_operation", "read_action"):
+                action_type = "inspect_metadata"
+                action_sensitivity = 0.5
+                evidence["action_type"] = {"source": "metadata_inference", "matched": "inspect_metadata"}
+                evidence["action_sensitivity"] = {"source": "metadata_inference", "matched": "0.5"}
+        elif server_name.lower() in ("postgres-mcp", "postgres"):
+            # Fixed PostgreSQL fallback: unmapped tools are not blanket-classified as database_records.
+            # Only classify as database_records if concrete record-level query/modification evidence exists.
+            if has_record_evidence:
                 data_target = "database_records"
                 data_sensitivity = 2.0
-                evidence["data_target"] = {"source": "server_context", "matched": server_name}
-                evidence["data_sensitivity"] = {"source": "server_context", "matched": server_name}
-            elif s_lower == "filesystem":
-                data_target = "filesystem_data"
-                data_sensitivity = 1.5
-                evidence["data_target"] = {"source": "server_context", "matched": server_name}
-                evidence["data_sensitivity"] = {"source": "server_context", "matched": server_name}
-            elif s_lower == "git":
-                data_target = "git_repository"
-                data_sensitivity = 1.0
-                evidence["data_target"] = {"source": "server_context", "matched": server_name}
-                evidence["data_sensitivity"] = {"source": "server_context", "matched": server_name}
+                evidence["data_target"] = {"source": "server_context_record_evidence", "matched": clean_name}
+                evidence["data_sensitivity"] = {"source": "server_context_record_evidence", "matched": "2.0"}
             else:
-                # 3. Check general sensitive data patterns
-                m_gen = (
-                    self._match_rules(sens_rules, description)
-                    or self._match_rules(sens_rules, prop_names)
-                    or self._match_rules(sens_rules, clean_name)
-                )
-                if m_gen:
-                    rule, matched_str = m_gen
+                # Evidence is insufficient: use safe default/unknown classification
+                data_target = defaults.get("data_target", "generic_resource")
+                data_sensitivity = float(defaults.get("data_sensitivity", 0.0))
+                evidence["data_target"] = {"source": "server_context_safe_default", "matched": "insufficient_evidence"}
+                evidence["data_sensitivity"] = {"source": "server_context_safe_default", "matched": str(data_sensitivity)}
+        elif server_name.lower() == "filesystem":
+            data_target = "filesystem_data"
+            data_sensitivity = 1.5
+            evidence["data_target"] = {"source": "server_context", "matched": server_name}
+            evidence["data_sensitivity"] = {"source": "server_context", "matched": server_name}
+        elif server_name.lower() == "git":
+            data_target = "git_repository"
+            data_sensitivity = 1.0
+            evidence["data_target"] = {"source": "server_context", "matched": server_name}
+            evidence["data_sensitivity"] = {"source": "server_context", "matched": server_name}
+        else:
+            # 3. Check general sensitive data patterns (preventing generic keywords alone from classifying as database_records)
+            m_gen = (
+                self._match_rules(sens_rules, description)
+                or self._match_rules(sens_rules, prop_names)
+                or self._match_rules(sens_rules, clean_name)
+            )
+            if m_gen:
+                rule, matched_str = m_gen
+                matched_target = rule.get("data_target", data_target)
+                if matched_target == "database_records" and not has_record_evidence:
+                    # Words such as database, query, table, or record alone are insufficient evidence.
+                    data_target = defaults.get("data_target", "generic_resource")
+                    data_sensitivity = float(defaults.get("data_sensitivity", 0.0))
+                    evidence["data_target"] = {"source": "filtered_generic_keyword", "matched": matched_str}
+                    evidence["data_sensitivity"] = {"source": "filtered_generic_keyword", "matched": str(data_sensitivity)}
+                else:
                     data_sensitivity = float(rule.get("data_sensitivity", data_sensitivity))
-                    data_target = rule.get("data_target", data_target)
+                    data_target = matched_target
                     src = "description" if self._word_match(rule.get("pattern", ""), description) else ("schema" if self._word_match(rule.get("pattern", ""), prop_names) else "name")
                     evidence["data_target"] = {"source": src, "matched": matched_str}
                     evidence["data_sensitivity"] = {"source": src, "matched": matched_str}
-                else:
-                    evidence["data_target"] = {"source": "fallback", "matched": data_target}
-                    evidence["data_sensitivity"] = {"source": "fallback", "matched": str(data_sensitivity)}
+            else:
+                evidence["data_target"] = {"source": "fallback", "matched": data_target}
+                evidence["data_sensitivity"] = {"source": "fallback", "matched": str(data_sensitivity)}
 
         # -------------------------------------------------------------------
         # Dimension D: External Exposure

@@ -61,9 +61,10 @@ async def get_capability_graph(db: AsyncSession = Depends(get_db)):
 @router.get("/paths")
 async def get_capability_paths(
     tool_name: Optional[str] = None,
+    path_id: Optional[str] = None,
     db: AsyncSession = Depends(get_db)
 ):
-    """Return compatible capability paths with scores, attributes, and severity."""
+    """Return compatible capability paths with scores, attributes, severity, and persistent path IDs."""
     mgr = get_active_client_manager()
     if mgr and hasattr(mgr, "capability_graph") and mgr.capability_graph:
         if tool_name:
@@ -71,15 +72,19 @@ async def get_capability_paths(
         else:
             exported = mgr.capability_graph.export_graph()
             paths = exported.get("paths", [])
+        if path_id:
+            paths = [p for p in paths if p.get("path_id") == path_id]
         return paths
 
     # Fallback to database
     persisted_paths = await get_persisted_capability_paths(tool_name=tool_name, session=db)
+    if path_id:
+        persisted_paths = [p for p in persisted_paths if p.get("path_id") == path_id]
     return persisted_paths
 
 
 @router.get("/tools")
-async def list_tool_capabilities():
+async def list_tool_capabilities(db: AsyncSession = Depends(get_db)):
     """List deterministically classified tool capabilities."""
     mgr = get_active_client_manager()
     if mgr and hasattr(mgr, "capability_graph") and mgr.capability_graph:
@@ -99,4 +104,31 @@ async def list_tool_capabilities():
             }
             for cap in mgr.capability_graph.tool_capabilities.values()
         ]
-    return []
+
+    # Database fallback
+    from sqlalchemy import select
+    from mcpath.backend.persistence.models import CapabilityDB
+    try:
+        stmt = select(CapabilityDB)
+        res = await db.execute(stmt)
+        caps = res.scalars().all()
+        return [
+            {
+                "tool_name": cap.tool_name,
+                "server_name": cap.server_name,
+                "data_target": cap.resource_type,
+                "operation": cap.operation,
+                "action_type": cap.action,
+                "data_sensitivity": cap.data_sensitivity,
+                "action_sensitivity": cap.action_sensitivity,
+                "external_exposure": cap.external_exposure,
+                "external_destination": cap.destination,
+                "consumed_data_types": cap.metadata_json.get("consumed_data_types", []) if cap.metadata_json else [],
+                "policy_version": cap.policy_version
+            }
+            for cap in caps
+        ]
+    except Exception as e:
+        logger.warning("Failed to query tool capabilities from DB: %s", e)
+        return []
+

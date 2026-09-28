@@ -253,6 +253,34 @@ class PipelineRunner:
         # 5. Risk Engine pre-call evaluation
         self.risk_engine.evaluate(context.event_record)
 
+        # Structured runtime capability match logging
+        decision_val = (
+            context.event_record.decision.value
+            if hasattr(context.event_record.decision, "value")
+            else str(context.event_record.decision)
+        )
+        logger.info(
+            "Runtime capability match evaluation: "
+            "tool_name=%s matched_path=%s match_status=%s runtime_path_id=%s "
+            "risk_score=%s classification=%s decision=%s",
+            context.tool_name,
+            context.event_record.matched_path,
+            context.event_record.match_status,
+            context.event_record.runtime_path_id,
+            context.event_record.scores.capability_risk,
+            res2.metadata.get("classification"),
+            decision_val,
+            extra={
+                "tool_name": context.tool_name,
+                "matched_path": context.event_record.matched_path,
+                "match_status": context.event_record.match_status,
+                "runtime_path_id": context.event_record.runtime_path_id,
+                "risk_score": context.event_record.scores.capability_risk,
+                "classification": res2.metadata.get("classification"),
+                "decision": decision_val,
+            }
+        )
+
         # If pre-call evaluation results in BLOCK (e.g. from any other gate), persist now
         if context.event_record.decision == EnforcementDecision.BLOCK:
             self._print_terminal_alert(context, stage_res_list=[res2, res3, res4])

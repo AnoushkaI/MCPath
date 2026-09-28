@@ -150,6 +150,7 @@ class CapabilityPathDB(Base):
     __tablename__ = "capability_paths"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    path_id = Column(String(64), nullable=True, index=True)
     tool_name = Column(String(100), nullable=False, index=True)
     path_nodes = Column(JSON, nullable=False)
     path_edges = Column(JSON, nullable=False)
@@ -195,6 +196,11 @@ class SecurityEventDB(Base):
     expected_hash = Column(String(64), nullable=True)
     observed_hash = Column(String(64), nullable=True)
     hash_matched = Column(Boolean, nullable=True)
+
+    # Stage 2 Capability Path matching fields
+    runtime_path_id = Column(String(64), nullable=True, index=True)
+    matched_path = Column(Boolean, nullable=True)
+    match_status = Column(String(30), nullable=True)  # MATCHED, UNKNOWN, UNMODELED
 
     # Graded Risk Scores (Stages 2 - 5)
     capability_risk = Column(Float, nullable=True)

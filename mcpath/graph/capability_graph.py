@@ -17,6 +17,7 @@ Typed Edges:
 """
 
 from dataclasses import asdict, dataclass, field, replace as dc_replace
+import hashlib
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -25,6 +26,23 @@ import networkx as nx
 from mcpath.graph.capability_inference import CapabilityClassifier, ToolCapability
 
 logger = logging.getLogger("mcpath.graph.capability_graph")
+
+
+def generate_path_id(path_nodes: List[str]) -> str:
+    """Generate a unique, persistent identifier for a capability path.
+    
+    Stable across graph rebuilds when the underlying path nodes have not changed.
+    Format: path_{tool_name}_{sha256(path_nodes)[:8]}
+    """
+    tool_token = "generic"
+    for n in path_nodes:
+        if n.startswith("Tool:"):
+            raw_tool = n.split("Tool:", 1)[1]
+            tool_token = raw_tool.replace(":", "_").replace("-", "_")
+            break
+    node_str = "->".join(path_nodes)
+    digest = hashlib.sha256(node_str.encode("utf-8")).hexdigest()[:8]
+    return f"path_{tool_token}_{digest}"
 
 
 @dataclass
@@ -42,9 +60,13 @@ class PathScoringResult:
     explanation: str
     policy_version: str
     metadata: Dict[str, Any] = field(default_factory=dict)
+    path_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        if not d.get("path_id") and self.path_nodes and "Unknown/Unmodeled" not in self.path_nodes:
+            d["path_id"] = generate_path_id(self.path_nodes)
+        return d
 
 
 class CapabilityGraph:
@@ -579,6 +601,7 @@ class CapabilityGraph:
                     "CRITICAL PATH OVERRIDE: Sensitive Data flows to External Action and Destination"
                 ) + f" (Elevated to {final_score:.1f}, classification={classification})"
 
+        path_id = generate_path_id(path_nodes)
         return PathScoringResult(
             path_nodes=path_nodes,
             path_edges=path_edges,
@@ -594,8 +617,11 @@ class CapabilityGraph:
             metadata={
                 "base_score": base_score,
                 "weighted_sum": round(weighted_sum, 3),
-                "scale_max": scale_max
-            }
+                "scale_max": scale_max,
+                "path_id": path_id,
+                "path_type": "PRECOMPUTED_POSSIBLE"
+            },
+            path_id=path_id
         )
 
     def evaluate_runtime_call(
@@ -606,7 +632,8 @@ class CapabilityGraph:
         """Map actual tool-call sequence against compatible graph paths.
         
         If known -> score the matched path.
-        If no compatible path -> report 'CAPABILITY PATH: UNKNOWN / UNMODELED' and produce elevated result.
+        If no compatible path -> report 'CAPABILITY PATH: UNKNOWN' or 'CAPABILITY PATH: UNMODELED'
+        and produce elevated result.
         """
         # 1. Normalize tool name
         matched_cap = self.tool_capabilities.get(tool_name)
@@ -621,21 +648,75 @@ class CapabilityGraph:
         # 2. Check call history for multi-step sequence mapping
         if call_history and len(call_history) > 1:
             matching_history_paths: List[PathScoringResult] = []
+            canonical_name = matched_cap.tool_name if matched_cap else tool_name
             for prev_tool in call_history[:-1]:
                 prev_paths = self._computed_paths.get(prev_tool, [])
                 for p in prev_paths:
                     # Check if this path involves the current tool's action
-                    if any(f":{tool_name}:" in n for n in p.path_nodes):
+                    if any(
+                        f":{tool_name}:" in n
+                        or f":{canonical_name}:" in n
+                        for n in p.path_nodes
+                    ):
                         matching_history_paths.append(p)
             if matching_history_paths:
                 matching_history_paths.sort(key=lambda p: p.path_risk_score, reverse=True)
-                return matching_history_paths[0]
+                selected = matching_history_paths[0]
+                if len(matching_history_paths) > 1:
+                    selection_reason = (
+                        f"Multi-step sequence match: Correlated tool '{tool_name}' with call history {call_history[:-1]}. "
+                        f"{len(matching_history_paths)} candidate paths matched; selected highest-risk path "
+                        f"'{selected.path_id}' (score={selected.path_risk_score:.1f}, {selected.classification}) "
+                        f"for fail-secure upper bounding under zero-trust policy."
+                    )
+                else:
+                    selection_reason = (
+                        f"Multi-step sequence match: Correlated tool '{tool_name}' with call history {call_history[:-1]}. "
+                        f"Single candidate path '{selected.path_id}' matched."
+                    )
+                meta = dict(selected.metadata)
+                meta.update({
+                    "runtime_path_id": selected.path_id,
+                    "matched_path": True,
+                    "match_status": "MATCHED",
+                    "tool_name": tool_name,
+                    "risk_score": selected.path_risk_score,
+                    "classification": selected.classification,
+                    "selection_reason": selection_reason,
+                    "candidate_paths_count": len(matching_history_paths),
+                    "candidate_path_ids": [p.path_id for p in matching_history_paths if p.path_id],
+                    "path_type": "RUNTIME_MATCHED_SEQUENCE"
+                })
+                return dc_replace(selected, metadata=meta)
 
         # 3. If paths exist for this single tool, return the highest-risk compatible path
         if paths:
             # Sort by risk score descending
             sorted_paths = sorted(paths, key=lambda p: p.path_risk_score, reverse=True)
-            return sorted_paths[0]
+            selected = sorted_paths[0]
+            if len(sorted_paths) > 1:
+                selection_reason = (
+                    f"Multiple compatible paths ({len(sorted_paths)} candidates) matched for tool '{tool_name}'. "
+                    f"Selected highest-risk path '{selected.path_id}' (score={selected.path_risk_score:.1f}, "
+                    f"{selected.classification}) to ensure fail-secure worst-case bounding under zero-trust policy."
+                )
+            else:
+                selection_reason = f"Single compatible capability path '{selected.path_id}' matched for tool '{tool_name}'."
+
+            meta = dict(selected.metadata)
+            meta.update({
+                "runtime_path_id": selected.path_id,
+                "matched_path": True,
+                "match_status": "MATCHED",
+                "tool_name": tool_name,
+                "risk_score": selected.path_risk_score,
+                "classification": selected.classification,
+                "selection_reason": selection_reason,
+                "candidate_paths_count": len(sorted_paths),
+                "candidate_path_ids": [p.path_id for p in sorted_paths if p.path_id],
+                "path_type": "RUNTIME_MATCHED_SINGLE"
+            })
+            return dc_replace(selected, metadata=meta)
 
         # 4. Unknown / unmodeled path fallback (configurable in policy, never treated as safe)
         unknown_cfg = self.policy.get("unknown_path_handling", {
@@ -647,6 +728,16 @@ class CapabilityGraph:
         classification = unknown_cfg.get("classification", "HIGH")
         explanation = unknown_cfg.get("explanation", "CAPABILITY PATH: UNKNOWN / UNMODELED")
 
+        is_tool_known = matched_cap is not None or tool_name in self.tool_capabilities
+        if is_tool_known:
+            match_status = "UNMODELED"
+            detail_expl = f"{explanation} (UNMODELED): Tool '{tool_name}' is registered but has no compatible causal path modeled in the graph"
+            selection_reason = f"Tool '{tool_name}' is registered in server catalog, but no compatible graph path to a sink was enumerated. Fail-secure elevated score applied."
+        else:
+            match_status = "UNKNOWN"
+            detail_expl = f"{explanation} (UNKNOWN): Tool '{tool_name}' is not recognized in the capability graph"
+            selection_reason = f"Tool '{tool_name}' is completely unknown/unregistered in the capability graph. Fail-secure elevated score applied."
+
         return PathScoringResult(
             path_nodes=["Agent", f"Tool:{tool_name}", "Unknown/Unmodeled"],
             path_edges=["CAN_CALL", "UNKNOWN_RELATION"],
@@ -657,9 +748,20 @@ class CapabilityGraph:
             path_risk_score=elevated_score,
             classification=classification,
             is_critical_override=False,
-            explanation=f"{explanation}: Tool '{tool_name}' has no compatible path modeled in the capability graph",
+            explanation=f"{detail_expl} (Score: {elevated_score:.1f})",
             policy_version=self.policy_version,
-            metadata={"status": "UNKNOWN_PATH", "tool_name": tool_name}
+            metadata={
+                "status": match_status,
+                "tool_name": tool_name,
+                "runtime_path_id": None,
+                "matched_path": False,
+                "match_status": match_status,
+                "risk_score": elevated_score,
+                "classification": classification,
+                "selection_reason": selection_reason,
+                "path_type": "RUNTIME_OBSERVED_UNMODELED"
+            },
+            path_id=None
         )
 
     def get_paths_for_tool(self, tool_name: str) -> List[PathScoringResult]:

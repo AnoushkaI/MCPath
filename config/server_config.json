@@ -4,7 +4,8 @@
     "filesystem",
     "git",
     "rugpull-test",
-    "email-server"
+    "email-server",
+    "postgres-mcp"
   ],
   "servers": {
     "sample_reference_server": {

@@ -94,6 +94,23 @@ def create_proxy_server(
             original_name
         )
 
+        # Safe permanent diagnostic logging: request structure/keys only (no sensitive values or prompts)
+        params_keys = list(params.model_dump().keys()) if hasattr(params, "model_dump") else []
+        meta_obj = getattr(params, "meta", None)
+        meta_keys = list(meta_obj.keys()) if isinstance(meta_obj, dict) else []
+        args_keys = list(arguments.keys()) if isinstance(arguments, dict) else []
+        prompt_like_field_exists = any(
+            k in ("user_prompt", "prompt", "_user_prompt")
+            for k in (params_keys + meta_keys + args_keys)
+        )
+        logger.debug(
+            "Stage 3 request metadata: params_keys=%s, _meta_keys=%s, args_keys=%s, has_prompt_key=%s",
+            params_keys,
+            meta_keys,
+            args_keys,
+            prompt_like_field_exists,
+        )
+
         user_prompt = None
         if hasattr(params, "meta") and params.meta:
             user_prompt = params.meta.get("user_prompt") or params.meta.get("prompt")

@@ -368,12 +368,73 @@
       "external_exposure": 0.0,
       "external_destination": null,
       "consumed_data_types": ["database_records"]
+    },
+    "postgres_mcp_list_connection_profiles": {
+      "data_target": "database_metadata",
+      "operation": "READ",
+      "action_type": "inspect_metadata",
+      "data_sensitivity": 1.0,
+      "action_sensitivity": 0.5,
+      "external_exposure": 0.0,
+      "external_destination": null,
+      "consumed_data_types": ["database_metadata"]
+    },
+    "list_connection_profiles": {
+      "data_target": "database_metadata",
+      "operation": "READ",
+      "action_type": "inspect_metadata",
+      "data_sensitivity": 1.0,
+      "action_sensitivity": 0.5,
+      "external_exposure": 0.0,
+      "external_destination": null,
+      "consumed_data_types": ["database_metadata"]
+    },
+    "postgres_mcp_list_databases": {
+      "data_target": "database_metadata",
+      "operation": "READ",
+      "action_type": "inspect_metadata",
+      "data_sensitivity": 1.0,
+      "action_sensitivity": 0.5,
+      "external_exposure": 0.0,
+      "external_destination": null,
+      "consumed_data_types": ["database_metadata"]
+    },
+    "list_databases": {
+      "data_target": "database_metadata",
+      "operation": "READ",
+      "action_type": "inspect_metadata",
+      "data_sensitivity": 1.0,
+      "action_sensitivity": 0.5,
+      "external_exposure": 0.0,
+      "external_destination": null,
+      "consumed_data_types": ["database_metadata"]
+    },
+    "postgres_mcp_get_server_capabilities": {
+      "data_target": "database_metadata",
+      "operation": "READ",
+      "action_type": "inspect_metadata",
+      "data_sensitivity": 1.0,
+      "action_sensitivity": 0.5,
+      "external_exposure": 0.0,
+      "external_destination": null,
+      "consumed_data_types": ["database_metadata"]
+    },
+    "get_server_capabilities": {
+      "data_target": "database_metadata",
+      "operation": "READ",
+      "action_type": "inspect_metadata",
+      "data_sensitivity": 1.0,
+      "action_sensitivity": 0.5,
+      "external_exposure": 0.0,
+      "external_destination": null,
+      "consumed_data_types": ["database_metadata"]
     }
   },
   "pattern_inference_rules": {
     "sensitive_data_patterns": [
       {"pattern": "(?i)(pii|ssn|social_security|customer_profile|credentials|password|secret|auth_token|credit_card)", "data_sensitivity": 3.0, "data_target": "sensitive_data"},
       {"pattern": "(?i)(user_profile|user_account|user_data|customer|account|employee|financial|balance|invoice|billing)", "data_sensitivity": 2.5, "data_target": "customer_data"},
+      {"pattern": "(?i)(database_metadata|connection_profile|connection_profiles|server_capabilities|catalog_metadata|db_metadata)", "data_sensitivity": 1.0, "data_target": "database_metadata"},
       {"pattern": "(?i)(database|query|sql|table|record)", "data_sensitivity": 2.0, "data_target": "database_records"},
       {"pattern": "(?i)(file|path|directory|folder|fs)", "data_sensitivity": 1.5, "data_target": "filesystem_data"},
       {"pattern": "(?i)(repo|git|commit|branch|diff)", "data_sensitivity": 1.0, "data_target": "git_repository"}
@@ -388,6 +449,7 @@
       {"pattern": "(?i)(send|email|post|upload|webhook|broadcast|transmit)", "action_sensitivity": 3.0, "action_type": "external_transmission"},
       {"pattern": "(?i)(write|update|insert|create|modify|alter|patch|edit|move|rename|append)", "action_sensitivity": 2.0, "action_type": "modify_action"},
       {"pattern": "(?i)(commit|stage|checkout|branch|reset)", "action_sensitivity": 1.5, "action_type": "version_control_action"},
+      {"pattern": "(?i)(inspect_metadata|inspect_profiles|list_profiles|get_capabilities|server_capabilities|list_databases)", "action_sensitivity": 0.5, "action_type": "inspect_metadata"},
       {"pattern": "(?i)(read|get|fetch|list|query|search|inspect|status|log|diff|show)", "action_sensitivity": 1.0, "action_type": "read_action"}
     ],
     "external_exposure_patterns": [

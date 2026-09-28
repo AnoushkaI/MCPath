@@ -31,3 +31,23 @@ async def test_backend_overview_and_servers():
         res_dict = await client.get("/api/servers?format=dict")
         assert res_dict.status_code == 200
         assert "active_server" in res_dict.json()
+
+        # Verify inspector route
+        res_insp = await client.get("/api/hashes/inspector")
+        assert res_insp.status_code == 200
+        assert isinstance(res_insp.json(), list)
+
+        # Verify capabilities tools route
+        res_caps = await client.get("/api/capabilities/tools")
+        assert res_caps.status_code == 200
+        assert isinstance(res_caps.json(), list)
+
+        # Verify capability graph and paths routes
+        res_graph = await client.get("/api/capabilities/graph")
+        assert res_graph.status_code == 200
+        assert "nodes" in res_graph.json()
+
+        res_paths = await client.get("/api/capabilities/paths")
+        assert res_paths.status_code == 200
+        assert isinstance(res_paths.json(), list)
+
