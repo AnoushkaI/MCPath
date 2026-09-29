@@ -18,6 +18,37 @@ from frontend.streamlit_app.styles import (
 )
 
 
+@st.fragment(run_every="2s")
+def _render_pending_alert_fragment():
+    pending = client.get_pending_approvals()
+    if pending:
+        latest = pending[0]
+        st.markdown(f"""
+        <div style="background: rgba(245, 158, 11, 0.18); border: 2px solid #f59e0b; border-radius: 8px; padding: 14px 18px; margin-bottom: 20px;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <span style="font-size: 1.05rem; font-weight: 700; color: #f59e0b;">
+                    🚨 ACTION REQUIRED: {len(pending)} Tool Call(s) Held for Security Approval!
+                </span>
+                <span style="background: #f59e0b; color: #0b0f19; font-weight: 700; padding: 3px 10px; border-radius: 4px; font-size: 0.8rem;">
+                    LIVE HOLD PENDING
+                </span>
+            </div>
+            <div style="color: #f8fafc; font-size: 0.88rem; margin-top: 6px;">
+                <b>Server:</b> <code>{latest.get('server_name')}</code> &nbsp;|&nbsp;
+                <b>Tool:</b> <code style="color: #38bdf8;">{latest.get('tool_name')}</code> &nbsp;|&nbsp;
+                <b>Risk Score:</b> <b>{latest.get('risk_score', 0.0):.1f} (HOLD)</b> &nbsp;|&nbsp;
+                <b>Time:</b> {latest.get('created_at', '')}
+            </div>
+            <div style="color: #cbd5e1; font-size: 0.84rem; margin-top: 4px;">
+                <b>Reason:</b> {latest.get('reason', '')}
+            </div>
+            <div style="margin-top: 8px; font-size: 0.82rem; color: #94a3b8;">
+                👉 Open <b>Admin Approvals</b> in the sidebar to review invocation arguments, approve, or reject.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+
 def render_page():
     apply_soc_styles()
     render_header("Security Overview", "Zero-Trust MCP Proxy Enforcement Telemetry & Pipeline Status")
@@ -32,6 +63,9 @@ def render_page():
             f"🚨 **Backend Offline**: Unable to connect to MCPath API at `{client.base_url}`. "
             f"Error: {health.get('error')}. Please start the backend service."
         )
+
+    # Check for pending administrator approvals (Live 2s polling fragment)
+    _render_pending_alert_fragment()
 
     # -------------------------------------------------------------------------
     # Top KPI Metrics Grid

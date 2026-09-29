@@ -247,6 +247,8 @@ class DownstreamClientManager:
         self.recompute_exposed_tools()
         set_active_client_manager(None)
 
+    shutdown_all = stop_all_servers
+
     def register_active_session(
         self,
         server_name: str,

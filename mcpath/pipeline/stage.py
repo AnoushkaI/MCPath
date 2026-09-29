@@ -16,6 +16,7 @@ class PipelineContext(BaseModel):
     tool_response: Optional[Any] = None
     call_history: list[str] = Field(default_factory=list)
     event_record: SecurityEventRecord
+    pre_call_approved: bool = False
 
 
 class StageResult(BaseModel):

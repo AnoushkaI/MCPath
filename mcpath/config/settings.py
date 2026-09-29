@@ -72,8 +72,9 @@ class Settings(BaseSettings):
     behaviour_deviation_threshold: float = Field(default=0.60, alias="BEHAVIOUR_DEVIATION_THRESHOLD")
     response_risk_threshold: float = Field(default=0.65, alias="RESPONSE_RISK_THRESHOLD")
 
-    # Optional model keys for Stage 5 secondary classifier
+    # Model / Approval Settings
     anthropic_api_key: str | None = Field(default=None, alias="ANTHROPIC_API_KEY")
+    approval_timeout_seconds: float = Field(default=30.0, alias="APPROVAL_TIMEOUT_SECONDS")
 
     # Real downstream MCP server configuration.
     # Set these in .env — no defaults to avoid accidentally granting access to

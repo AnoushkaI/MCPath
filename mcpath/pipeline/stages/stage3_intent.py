@@ -36,8 +36,13 @@ def get_intent_model(model_name: str = "all-MiniLM-L6-v2"):
     with _MODEL_LOCK:
         if _CACHED_MODEL is None or _CACHED_MODEL_NAME != model_name:
             logger.info("Loading sentence-transformers model '%s' (singleton)...", model_name)
+            try:
+                import torch
+                torch.set_num_threads(1)
+            except Exception:
+                pass
             from sentence_transformers import SentenceTransformer
-            _CACHED_MODEL = SentenceTransformer(model_name)
+            _CACHED_MODEL = SentenceTransformer(model_name, device="cpu")
             _CACHED_MODEL_NAME = model_name
             logger.info("Model '%s' successfully loaded and cached.", model_name)
         return _CACHED_MODEL
@@ -284,13 +289,28 @@ class Stage3IntentRisk(BasePipelineStage):
         clean_prompt = str(user_prompt).strip()
 
         # Compute embeddings using cached model singleton
-        model = self.get_model()
-        emb_prompt = model.encode(clean_prompt, convert_to_tensor=True)
-        emb_tool = model.encode(tool_action_text, convert_to_tensor=True)
-
-        # Calculate cosine similarity and intent risk score
-        sim = compute_cosine_similarity(emb_prompt, emb_tool)
-        score, classification = self.calculate_intent_risk_score(sim)
+        try:
+            model = self.get_model()
+            emb_prompt = model.encode(clean_prompt, convert_to_tensor=True)
+            emb_tool = model.encode(tool_action_text, convert_to_tensor=True)
+            sim = compute_cosine_similarity(emb_prompt, emb_tool)
+            score, classification = self.calculate_intent_risk_score(sim)
+        except Exception as exc:
+            logger.warning("Intent embedding evaluation failed (%s). Falling back to neutral intent score.", exc)
+            context.event_record.scores.intent_risk = None
+            return StageResult(
+                stage_name=self.name,
+                score=None,
+                hard_block=False,
+                passed=True,
+                explanation=f"Stage 3 evaluation failed due to runtime error: {exc}",
+                metadata={
+                    "status": "ERROR_FALLBACK",
+                    "error": str(exc),
+                    "policy_version": self.policy_version,
+                    "evaluated_at": datetime.now(timezone.utc).isoformat()
+                }
+            )
 
         # Produce score for Risk Engine evaluation (Stage 3 NEVER independently blocks or holds)
         context.event_record.scores.intent_risk = score

@@ -44,7 +44,8 @@ class Stage2CapabilityRisk(BasePipelineStage):
         # Map actual tool call sequence against compatible graph paths
         result: PathScoringResult = self.graph.evaluate_runtime_call(
             tool_name=tool_name,
-            call_history=history
+            call_history=history,
+            arguments=context.arguments
         )
 
         # Produce capability result for Risk Engine evaluation

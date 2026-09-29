@@ -281,8 +281,8 @@ class PipelineRunner:
             }
         )
 
-        # If pre-call evaluation results in BLOCK (e.g. from any other gate), persist now
-        if context.event_record.decision == EnforcementDecision.BLOCK:
+        # If pre-call evaluation results in BLOCK or HOLD, persist immediately
+        if context.event_record.decision in (EnforcementDecision.BLOCK, EnforcementDecision.HOLD):
             self._print_terminal_alert(context, stage_res_list=[res2, res3, res4])
             if self.persist_events:
                 try:
@@ -291,7 +291,7 @@ class PipelineRunner:
                         stage_results=self._recorded_stage_results
                     )
                 except Exception as e:
-                    logger.error("Failed to persist pre-call blocked security event: %s", e)
+                    logger.error("Failed to persist pre-call security event: %s", e)
 
         return context.event_record
 
@@ -311,7 +311,18 @@ class PipelineRunner:
         })
 
         # Final Risk Engine evaluation
-        self.risk_engine.evaluate(context.event_record)
+        if getattr(context, "pre_call_approved", False):
+            # Pre-call HOLD was explicitly approved by administrator. Only Stage 5 response risk can block now.
+            if res5.score is not None and res5.score >= self.risk_engine.high_threshold:
+                context.event_record.decision = EnforcementDecision.BLOCK
+                context.event_record.reason = f"Response egress risk detected: score {res5.score:.1f} >= {self.risk_engine.high_threshold}"
+                context.event_record.action_taken = "Blocked post-execution by response inspection"
+            else:
+                context.event_record.decision = EnforcementDecision.ALLOW
+                context.event_record.reason = "Approved by administrator and safe response egress verified"
+                context.event_record.action_taken = "Forwarded after administrator approval"
+        else:
+            self.risk_engine.evaluate(context.event_record)
 
         if context.event_record.decision == EnforcementDecision.BLOCK:
             self._print_terminal_alert(context, stage_num=5, stage_name="5 — Response Risk", stage_res=res5)

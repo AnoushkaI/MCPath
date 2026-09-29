@@ -336,6 +336,57 @@ class MCPathAPIClient:
         except Exception as e:
             return False, str(e)
 
+    # -------------------------------------------------------------------------
+    # Administrator Approval Queue
+    # -------------------------------------------------------------------------
+
+    def get_approvals(self, status: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+        """Fetch approvals from /api/approvals."""
+        params = {"limit": limit}
+        if status and status != "All":
+            params["status"] = status
+        try:
+            resp = requests.get(f"{self.base_url}/api/approvals", params=params, timeout=TIMEOUT_SECONDS)
+            if resp.status_code == 200:
+                return resp.json()
+            return []
+        except Exception as e:
+            logger.error("Error fetching approvals: %s", e)
+            return []
+
+    def get_pending_approvals(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Fetch pending approvals."""
+        return self.get_approvals(status="PENDING", limit=limit)
+
+    def approve_call(self, approval_id: str, resolver: str = "admin") -> Tuple[bool, Any]:
+        """Approve a held tool invocation."""
+        try:
+            resp = requests.post(
+                f"{self.base_url}/api/approvals/{approval_id}/approve",
+                params={"resolver": resolver},
+                timeout=TIMEOUT_SECONDS
+            )
+            if resp.status_code == 200:
+                return True, resp.json()
+            return False, resp.json().get("detail", resp.text)
+        except Exception as e:
+            return False, str(e)
+
+    def reject_call(self, approval_id: str, resolver: str = "admin") -> Tuple[bool, Any]:
+        """Reject a held tool invocation."""
+        try:
+            resp = requests.post(
+                f"{self.base_url}/api/approvals/{approval_id}/reject",
+                params={"resolver": resolver},
+                timeout=TIMEOUT_SECONDS
+            )
+            if resp.status_code == 200:
+                return True, resp.json()
+            return False, resp.json().get("detail", resp.text)
+        except Exception as e:
+            return False, str(e)
+
 
 # Default singleton instance
 client = MCPathAPIClient()
+

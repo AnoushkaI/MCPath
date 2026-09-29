@@ -5,6 +5,9 @@ from typing import Any, Dict, Optional
 from pydantic import BaseModel, Field
 
 
+from uuid import uuid4
+
+
 class EnforcementDecision(str, Enum):
     """Enforcement outcome produced by the deterministic Risk Engine."""
     ALLOW = "ALLOW"
@@ -22,7 +25,7 @@ class RiskScores(BaseModel):
 
 class SecurityEventRecord(BaseModel):
     """Complete explainable record of an intercepted call and its evaluation."""
-    event_id: Optional[str] = None
+    event_id: str = Field(default_factory=lambda: f"evt_{uuid4().hex[:12]}")
     timestamp: str
     server_name: str
     tool_name: str

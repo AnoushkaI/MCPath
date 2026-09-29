@@ -146,7 +146,7 @@ def create_proxy_server(
         # 2. Phase 1: Pre-execution pipeline (Stage 1 Hash Check + Stages 2-4 + Risk Engine Phase 1)
         evaluated_event = await runner.run_pre_call(pipeline_ctx)
 
-        if evaluated_event.decision in (EnforcementDecision.BLOCK, EnforcementDecision.HOLD):
+        if evaluated_event.decision == EnforcementDecision.BLOCK:
             explanation = format_explanation(evaluated_event)
             logger.warning("EXECUTION BLOCKED by MCPath Proxy Security Gate:\n%s", explanation)
             return types.CallToolResult(
@@ -154,7 +154,69 @@ def create_proxy_server(
                 content=[types.TextContent(type="text", text=explanation)]
             )
 
-        # 3. Forward call to the correct downstream MCP server ONLY if decision is ALLOW
+        if evaluated_event.decision == EnforcementDecision.HOLD:
+            from mcpath.proxy.approval_manager import approval_manager
+            from mcpath.config.settings import settings
+            timeout_sec = float(getattr(settings, "approval_timeout_seconds", 30.0))
+            is_non_blocking = False
+            if isinstance(arguments, dict) and arguments.get("_non_blocking_hold"):
+                is_non_blocking = True
+
+            approval_id, _ = await approval_manager.register_hold(
+                context=pipeline_ctx,
+                event_record=evaluated_event,
+                timeout_seconds=timeout_sec
+            )
+
+            if is_non_blocking or timeout_sec <= 0:
+                explanation = format_explanation(evaluated_event)
+                logger.warning(
+                    "EXECUTION HELD FOR ADMINISTRATIVE APPROVAL (Non-blocking mode, approval_id=%s) for '%s:%s'",
+                    approval_id, owning_server, original_name
+                )
+                return types.CallToolResult(
+                    is_error=True,
+                    content=[types.TextContent(
+                        type="text",
+                        text=f"EXECUTION HELD FOR REVIEW\nApproval ID: {approval_id}\n{explanation}"
+                    )]
+                )
+
+            logger.warning(
+                "EXECUTION HELD FOR ADMINISTRATIVE APPROVAL (approval_id=%s) for '%s:%s'. Waiting up to %.1fs...",
+                approval_id, owning_server, original_name, timeout_sec
+            )
+            decision_status = await approval_manager.wait_for_decision(
+                approval_id=approval_id,
+                timeout_seconds=timeout_sec
+            )
+            if decision_status == "APPROVED":
+                logger.info(
+                    "HOLD approval GRANTED by administrator for '%s:%s' (approval_id=%s). Forwarding to downstream server...",
+                    owning_server, original_name, approval_id
+                )
+                pipeline_ctx.pre_call_approved = True
+                evaluated_event.action_taken = "Forwarded after administrator approval"
+            elif decision_status == "TIMED_OUT":
+                logger.warning("HOLD approval TIMED OUT for '%s:%s' (approval_id=%s)", owning_server, original_name, approval_id)
+                return types.CallToolResult(
+                    is_error=True,
+                    content=[types.TextContent(
+                        type="text",
+                        text=f"EXECUTION HELD FOR REVIEW (Timed Out)\nApproval ID: {approval_id}\nReason: Timed out waiting for administrator approval after {timeout_sec:.0f}s."
+                    )]
+                )
+            else:  # REJECTED
+                logger.warning("HOLD approval REJECTED by administrator for '%s:%s' (approval_id=%s)", owning_server, original_name, approval_id)
+                return types.CallToolResult(
+                    is_error=True,
+                    content=[types.TextContent(
+                        type="text",
+                        text=f"EXECUTION HELD AND REJECTED\nApproval ID: {approval_id}\nReason: Administrator rejected the tool invocation."
+                    )]
+                )
+
+        # 3. Forward call to the correct downstream MCP server ONLY if decision is ALLOW or APPROVED
         target_session = client_manager.get_session(owning_server)
         if not target_session:
             logger.error("Downstream session for server '%s' is not active", owning_server)
@@ -182,7 +244,9 @@ def create_proxy_server(
         pipeline_ctx.tool_response = downstream_result
         final_event = await runner.run_post_call(pipeline_ctx)
 
-        if final_event.decision in (EnforcementDecision.BLOCK, EnforcementDecision.HOLD):
+        if final_event.decision == EnforcementDecision.BLOCK or (
+            final_event.decision == EnforcementDecision.HOLD and not getattr(pipeline_ctx, "pre_call_approved", False)
+        ):
             explanation = format_explanation(final_event)
             logger.warning("EXECUTION BLOCKED post-execution by response inspection:\n%s", explanation)
             return types.CallToolResult(

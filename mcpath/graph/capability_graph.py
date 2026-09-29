@@ -21,6 +21,7 @@ import hashlib
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+import re
 import networkx as nx
 
 from mcpath.graph.capability_inference import CapabilityClassifier, ToolCapability
@@ -624,16 +625,38 @@ class CapabilityGraph:
             path_id=path_id
         )
 
+    def _is_direct_path(self, path_nodes: List[str], tool_name: str) -> bool:
+        """Determine whether a path represents a direct action of the specified tool."""
+        act_nodes = [n for n in path_nodes if n.startswith("Action:")]
+        if not act_nodes:
+            return False
+        act_node_id = act_nodes[0]
+        act_tool = self.graph.nodes.get(act_node_id, {}).get("tool_name")
+        if not act_tool:
+            parts = act_node_id.split(":", 2)
+            act_tool = parts[1] if len(parts) > 1 else ""
+        if act_tool == tool_name:
+            return True
+        def clean(t: str) -> str:
+            for pfx in ("postgres_mcp_", "postgres_", "git_", "fs_", "filesystem_", "rugpull-test_", "rugpull_test_", "email_server_", "email-server_"):
+                if t.lower().startswith(pfx):
+                    return t[len(pfx):]
+            return t
+        return clean(act_tool) == clean(tool_name)
+
     def evaluate_runtime_call(
         self,
         tool_name: str,
-        call_history: Optional[List[str]] = None
+        call_history: Optional[List[str]] = None,
+        arguments: Optional[Dict[str, Any]] = None
     ) -> PathScoringResult:
         """Map actual tool-call sequence against compatible graph paths.
         
-        If known -> score the matched path.
-        If no compatible path -> report 'CAPABILITY PATH: UNKNOWN' or 'CAPABILITY PATH: UNMODELED'
-        and produce elevated result.
+        Evaluates actual runtime activity, not theoretical future attack paths.
+        Direct paths are evaluated for isolated calls, while multi-step call histories
+        correlate observed cross-tool data flows (e.g. read followed by external email).
+        Uninvoked potential paths remain visible in the graph topology for threat modeling
+        without triggering unwarranted pre-emptive blocks.
         """
         # 1. Normalize tool name
         matched_cap = self.tool_capabilities.get(tool_name)
@@ -645,35 +668,90 @@ class CapabilityGraph:
         if not paths and matched_cap:
             paths = self._computed_paths.get(matched_cap.tool_name) or []
 
+        canonical_name = matched_cap.tool_name if matched_cap else tool_name
+
+        direct_paths: List[PathScoringResult] = []
+        potential_cross_tool_paths: List[PathScoringResult] = []
+        for p in paths:
+            if self._is_direct_path(p.path_nodes, tool_name) or self._is_direct_path(p.path_nodes, canonical_name):
+                direct_paths.append(p)
+            else:
+                potential_cross_tool_paths.append(p)
+
+        data_access_cfg = self.policy.get("data_access_policy", {})
+
         # 2. Check call history for multi-step sequence mapping
         if call_history and len(call_history) > 1:
             matching_history_paths: List[PathScoringResult] = []
-            canonical_name = matched_cap.tool_name if matched_cap else tool_name
             for prev_tool in call_history[:-1]:
                 prev_paths = self._computed_paths.get(prev_tool, [])
+                if not prev_paths and "_" in prev_tool:
+                    prev_suffix = prev_tool.split("_", 1)[1]
+                    prev_paths = self._computed_paths.get(prev_suffix, [])
                 for p in prev_paths:
                     # Check if this path involves the current tool's action
-                    if any(
+                    has_current_action = any(
                         f":{tool_name}:" in n
                         or f":{canonical_name}:" in n
                         for n in p.path_nodes
-                    ):
+                    )
+                    if not has_current_action:
+                        continue
+
+                    # Multi-step chains represent observed exfiltration or external transmission.
+                    # Ordinary, authorized read-only operations (e.g. read_file, list_directory) must
+                    # NOT be classified as attack chains merely because other tools were called previously.
+                    is_external_or_exfil = (
+                        p.is_critical_override
+                        or p.external_exposure > 0
+                        or any(self.graph.nodes.get(n, {}).get("type") == "External Destination" for n in p.path_nodes)
+                        or any(ext_kw in n.lower() for n in p.path_nodes for ext_kw in (":external", ":send", ":upload", ":webhook", ":transmit", ":email"))
+                    )
+                    if is_external_or_exfil:
                         matching_history_paths.append(p)
+
             if matching_history_paths:
+                # Check for authorized recipient in communication actions
+                recipient_val = ""
+                if isinstance(arguments, dict):
+                    recipient_val = str(arguments.get("recipient") or arguments.get("to") or "")
+                auth_recipients = data_access_cfg.get("authorized_email_recipients", [])
+                is_authorized_recipient = any(domain in recipient_val for domain in auth_recipients) if (recipient_val and auth_recipients) else False
+
                 matching_history_paths.sort(key=lambda p: p.path_risk_score, reverse=True)
                 selected = matching_history_paths[0]
-                if len(matching_history_paths) > 1:
+
+                if is_authorized_recipient:
+                    # Authorized recipient: destination is internal/trusted
+                    selected_score = min(selected.path_risk_score, 25.0)
+                    selected_class = "LOW"
                     selection_reason = (
                         f"Multi-step sequence match: Correlated tool '{tool_name}' with call history {call_history[:-1]}. "
-                        f"{len(matching_history_paths)} candidate paths matched; selected highest-risk path "
-                        f"'{selected.path_id}' (score={selected.path_risk_score:.1f}, {selected.classification}) "
-                        f"for fail-secure upper bounding under zero-trust policy."
+                        f"Recipient '{recipient_val}' is authorized under data-access policy (score={selected_score:.1f}, {selected_class})."
                     )
-                else:
-                    selection_reason = (
-                        f"Multi-step sequence match: Correlated tool '{tool_name}' with call history {call_history[:-1]}. "
-                        f"Single candidate path '{selected.path_id}' matched."
-                    )
+                    meta = dict(selected.metadata)
+                    meta.update({
+                        "runtime_path_id": selected.path_id,
+                        "matched_path": True,
+                        "match_status": "MATCHED",
+                        "tool_name": tool_name,
+                        "risk_score": selected_score,
+                        "classification": selected_class,
+                        "selection_reason": selection_reason,
+                        "candidate_paths_count": len(matching_history_paths),
+                        "candidate_path_ids": [p.path_id for p in matching_history_paths if p.path_id],
+                        "path_type": "RUNTIME_MATCHED_SEQUENCE_AUTHORIZED",
+                        "observed_chain": True,
+                        "potential_attack_paths": [p.to_dict() for p in potential_cross_tool_paths],
+                        "potential_paths_count": len(potential_cross_tool_paths)
+                    })
+                    return dc_replace(selected, path_risk_score=selected_score, classification=selected_class, is_critical_override=False, metadata=meta)
+
+                selection_reason = (
+                    f"Multi-step sequence match: Correlated tool '{tool_name}' with call history {call_history[:-1]}. "
+                    f"Observed runtime chain from prior data access to external action selected '{selected.path_id}' "
+                    f"(score={selected.path_risk_score:.1f}, {selected.classification})."
+                )
                 meta = dict(selected.metadata)
                 meta.update({
                     "runtime_path_id": selected.path_id,
@@ -685,25 +763,304 @@ class CapabilityGraph:
                     "selection_reason": selection_reason,
                     "candidate_paths_count": len(matching_history_paths),
                     "candidate_path_ids": [p.path_id for p in matching_history_paths if p.path_id],
-                    "path_type": "RUNTIME_MATCHED_SEQUENCE"
+                    "path_type": "RUNTIME_MATCHED_SEQUENCE",
+                    "observed_chain": True,
+                    "potential_attack_paths": [p.to_dict() for p in potential_cross_tool_paths],
+                    "potential_paths_count": len(potential_cross_tool_paths)
                 })
                 return dc_replace(selected, metadata=meta)
 
-        # 3. If paths exist for this tool, return the highest-risk compatible path
-        # to ensure fail-secure worst-case bounding under zero-trust policy.
-        if paths:
-            # Sort candidate paths by risk score descending
-            sorted_paths = sorted(paths, key=lambda p: p.path_risk_score, reverse=True)
-            selected = sorted_paths[0]
-            if len(sorted_paths) > 1:
-                selection_reason = (
-                    f"Multiple compatible paths ({len(sorted_paths)} candidates) matched for tool '{tool_name}'. "
-                    f"Selected highest-risk path '{selected.path_id}' (score={selected.path_risk_score:.1f}, "
-                    f"{selected.classification}) to ensure fail-secure worst-case bounding under zero-trust policy."
-                )
-            else:
-                selection_reason = f"Single compatible capability path '{selected.path_id}' matched for tool '{tool_name}'."
+        # 3. Direct execution evaluation for the current tool call
+        # Check dynamic SQL context if tool is database query
+        query_str = None
+        if isinstance(arguments, dict):
+            query_str = arguments.get("query") or arguments.get("sql")
 
+        clean_tool = tool_name.lower()
+        is_db_query_tool = any(kw in clean_tool for kw in ("postgres_mcp_query", "query", "sql_query"))
+        if is_db_query_tool and query_str and isinstance(query_str, str):
+            clean_q = query_str.strip()
+            is_read_query = bool(re.match(r"(?i)^\s*(SELECT|EXPLAIN|SHOW|WITH)\b", clean_q))
+            if is_read_query:
+                restricted_pats = data_access_cfg.get("restricted_patterns", [
+                    r"(?i)(password|secret|credential|auth_token|credit_card|private_key|api_key|ssn)"
+                ])
+                violates_policy = any(re.search(pat, clean_q) for pat in restricted_pats)
+                if not violates_policy:
+                    # Authorized read operation within configured data-access policy
+                    authorized_sens = float(data_access_cfg.get("authorized_read_data_sensitivity", 1.0))
+                    weights = self.policy.get("weights", {"data_sensitivity": 0.30, "action_sensitivity": 0.25, "external_exposure": 0.20, "chain_risk": 0.25})
+                    scale_max = float(self.policy.get("scale_max", 3.0))
+                    w_sum = (float(weights.get("data_sensitivity", 0.30)) * authorized_sens) + \
+                            (float(weights.get("action_sensitivity", 0.25)) * 1.0) + \
+                            (float(weights.get("external_exposure", 0.20)) * 0.0) + \
+                            (float(weights.get("chain_risk", 0.25)) * 0.2)
+                    read_score = round((w_sum / scale_max) * 100.0, 2)
+                    classification = "LOW" if read_score < 30.0 else ("MEDIUM" if read_score < 70.0 else "HIGH")
+                    nodes = ["Agent", f"Tool:{tool_name}", "Resource:database_records", f"Action:{tool_name}:query_database"]
+                    path_id = generate_path_id(nodes)
+                    selection_reason = (
+                        f"Authorized read-only database query within configured data-access policy. "
+                        f"Evaluated as read operation with sensitivity {authorized_sens:.1f} (score={read_score:.1f}, {classification}). "
+                        f"{len(potential_cross_tool_paths)} potential uninvoked cross-tool paths preserved for graph topology."
+                    )
+                    return PathScoringResult(
+                        path_nodes=nodes,
+                        path_edges=["CAN_CALL", "READS", "FLOWS_TO"],
+                        data_sensitivity=authorized_sens,
+                        action_sensitivity=1.0,
+                        external_exposure=0.0,
+                        chain_risk=0.2,
+                        path_risk_score=read_score,
+                        classification=classification,
+                        is_critical_override=False,
+                        explanation=f"Authorized read-only query within configured data-access policy (Score: {read_score:.1f}, {classification})",
+                        policy_version=self.policy_version,
+                        metadata={
+                            "runtime_path_id": path_id,
+                            "matched_path": True,
+                            "match_status": "MATCHED",
+                            "tool_name": tool_name,
+                            "risk_score": read_score,
+                            "classification": classification,
+                            "selection_reason": selection_reason,
+                            "observed_chain": False,
+                            "path_type": "RUNTIME_OBSERVED_DIRECT_READ",
+                            "potential_attack_paths": [p.to_dict() for p in potential_cross_tool_paths],
+                            "potential_paths_count": len(potential_cross_tool_paths)
+                        },
+                        path_id=path_id
+                    )
+
+        # Check dynamic filesystem context if tool is filesystem read
+        fs_read_tools = {
+            "read_file", "read_text_file", "read_media_file", "read_multiple_files",
+            "list_directory", "list_directory_with_sizes", "directory_tree",
+            "get_file_info", "search_files", "list_allowed_directories"
+        }
+        raw_fs_name = tool_name.lower()
+        for pfx in ("filesystem_", "fs_"):
+            if raw_fs_name.startswith(pfx):
+                raw_fs_name = raw_fs_name[len(pfx):]
+                break
+
+        if raw_fs_name in fs_read_tools:
+            raw_paths: List[str] = []
+            if isinstance(arguments, dict):
+                if "path" in arguments and isinstance(arguments["path"], str):
+                    raw_paths.append(arguments["path"])
+                elif "paths" in arguments and isinstance(arguments["paths"], list):
+                    raw_paths.extend([str(p) for p in arguments["paths"]])
+                elif "directory" in arguments and isinstance(arguments["directory"], str):
+                    raw_paths.append(arguments["directory"])
+
+            # Determine authorized directories from policy and settings
+            auth_dirs: List[str] = list(data_access_cfg.get("authorized_directories", []))
+            try:
+                from mcpath.config.settings import settings
+                cfg_allowed = getattr(settings, "filesystem_allowed_paths", "")
+                if cfg_allowed:
+                    for d in cfg_allowed.split(";" if ";" in cfg_allowed else ","):
+                        d_clean = d.strip().replace("\\", "/").rstrip("/")
+                        if d_clean and d_clean not in auth_dirs:
+                            auth_dirs.append(d_clean)
+            except Exception:
+                pass
+
+            restricted_pats = data_access_cfg.get("restricted_file_patterns", [
+                r"(?i)(\.env|id_rsa|id_ed25519|passwd|shadow|credentials|secret|token|\.ssh|\.gnupg|password)"
+            ])
+
+            is_restricted = False
+            is_unauthorized = False
+            eval_reason = ""
+
+            for p_str in raw_paths:
+                p_norm = p_str.replace("\\", "/")
+                # Check path traversal
+                if "../" in p_norm or "/.." in p_norm or p_norm.startswith(".."):
+                    is_unauthorized = True
+                    eval_reason = f"Path traversal attempt outside authorized directories: '{p_str}'"
+                    break
+
+                # Check known sensitive operating system root paths
+                if re.match(r"(?i)^([a-z]:/|/)(windows|system32|etc|var|root|boot|sys)", p_norm):
+                    is_unauthorized = True
+                    eval_reason = f"Attempted access to unauthorized system directory: '{p_str}'"
+                    break
+
+                # Check restricted/credential pattern
+                if any(re.search(pat, p_norm) for pat in restricted_pats):
+                    is_restricted = True
+                    eval_reason = f"Access to restricted or credential file pattern in path: '{p_str}'"
+                    break
+
+                # If absolute path, verify it falls under an authorized directory
+                if re.match(r"(?i)^([a-z]:/|/)", p_norm):
+                    in_auth = any(
+                        p_norm.lower().startswith(ad.lower().rstrip("/") + "/") or p_norm.lower() == ad.lower().rstrip("/")
+                        for ad in auth_dirs
+                    )
+                    if not in_auth and auth_dirs:
+                        is_unauthorized = True
+                        eval_reason = f"Path '{p_str}' is outside authorized directories: {auth_dirs}"
+                        break
+
+            weights = self.policy.get("weights", {"data_sensitivity": 0.30, "action_sensitivity": 0.25, "external_exposure": 0.20, "chain_risk": 0.25})
+            scale_max = float(self.policy.get("scale_max", 3.0))
+
+            if is_unauthorized:
+                # Unauthorized path / path traversal -> HIGH (BLOCK)
+                data_sens = float(data_access_cfg.get("unauthorized_path_sensitivity", 3.0))
+                action_sens = 2.0
+                ext_exp = 1.0
+                chain_risk = 2.0
+                w_sum = (float(weights.get("data_sensitivity", 0.30)) * data_sens) + \
+                        (float(weights.get("action_sensitivity", 0.25)) * action_sens) + \
+                        (float(weights.get("external_exposure", 0.20)) * ext_exp) + \
+                        (float(weights.get("chain_risk", 0.25)) * chain_risk)
+                fs_score = min(100.0, round((w_sum / scale_max) * 100.0, 2))
+                classification = "HIGH"
+                nodes = ["Agent", f"Tool:{tool_name}", "Resource:unauthorized_filesystem_data", f"Action:{tool_name}:unauthorized_access"]
+                path_id = generate_path_id(nodes)
+                return PathScoringResult(
+                    path_nodes=nodes,
+                    path_edges=["CAN_CALL", "ACCESSES", "FLOWS_TO"],
+                    data_sensitivity=data_sens,
+                    action_sensitivity=action_sens,
+                    external_exposure=ext_exp,
+                    chain_risk=chain_risk,
+                    path_risk_score=fs_score,
+                    classification=classification,
+                    is_critical_override=True,
+                    explanation=f"POLICY BLOCK: Unauthorized directory or traversal attempt: {eval_reason} (Score: {fs_score:.1f}, {classification})",
+                    policy_version=self.policy_version,
+                    metadata={
+                        "runtime_path_id": path_id,
+                        "matched_path": True,
+                        "match_status": "MATCHED",
+                        "tool_name": tool_name,
+                        "risk_score": fs_score,
+                        "classification": classification,
+                        "selection_reason": eval_reason,
+                        "observed_chain": False,
+                        "path_type": "RUNTIME_OBSERVED_UNAUTHORIZED_PATH",
+                        "potential_attack_paths": [p.to_dict() for p in potential_cross_tool_paths],
+                        "potential_paths_count": len(potential_cross_tool_paths)
+                    },
+                    path_id=path_id
+                )
+
+            elif is_restricted:
+                # Restricted credential / secret file -> MEDIUM (HOLD)
+                data_sens = float(data_access_cfg.get("restricted_data_sensitivity", 3.0))
+                action_sens = 1.0
+                ext_exp = 0.0
+                chain_risk = 1.0
+                w_sum = (float(weights.get("data_sensitivity", 0.30)) * data_sens) + \
+                        (float(weights.get("action_sensitivity", 0.25)) * action_sens) + \
+                        (float(weights.get("external_exposure", 0.20)) * ext_exp) + \
+                        (float(weights.get("chain_risk", 0.25)) * chain_risk)
+                fs_score = round((w_sum / scale_max) * 100.0, 2)
+                classification = "MEDIUM"
+                nodes = ["Agent", f"Tool:{tool_name}", "Resource:restricted_credentials", f"Action:{tool_name}:read_filesystem"]
+                path_id = generate_path_id(nodes)
+                return PathScoringResult(
+                    path_nodes=nodes,
+                    path_edges=["CAN_CALL", "READS", "FLOWS_TO"],
+                    data_sensitivity=data_sens,
+                    action_sensitivity=action_sens,
+                    external_exposure=ext_exp,
+                    chain_risk=chain_risk,
+                    path_risk_score=fs_score,
+                    classification=classification,
+                    is_critical_override=False,
+                    explanation=f"POLICY HOLD: Sensitive credential file read requires review: {eval_reason} (Score: {fs_score:.1f}, {classification})",
+                    policy_version=self.policy_version,
+                    metadata={
+                        "runtime_path_id": path_id,
+                        "matched_path": True,
+                        "match_status": "MATCHED",
+                        "tool_name": tool_name,
+                        "risk_score": fs_score,
+                        "classification": classification,
+                        "selection_reason": eval_reason,
+                        "observed_chain": False,
+                        "path_type": "RUNTIME_OBSERVED_RESTRICTED_READ",
+                        "potential_attack_paths": [p.to_dict() for p in potential_cross_tool_paths],
+                        "potential_paths_count": len(potential_cross_tool_paths)
+                    },
+                    path_id=path_id
+                )
+
+            else:
+                # Authorized benign read or directory listing -> LOW (ALLOW)
+                is_dir_listing = raw_fs_name in {
+                    "list_directory", "list_directory_with_sizes", "directory_tree",
+                    "get_file_info", "list_allowed_directories"
+                }
+                if is_dir_listing:
+                    data_sens = float(data_access_cfg.get("authorized_dir_list_sensitivity", 0.5))
+                    action_sens = 0.5
+                    chain_risk = 0.1
+                else:
+                    data_sens = float(data_access_cfg.get("authorized_read_file_sensitivity", 1.0))
+                    action_sens = 1.0
+                    chain_risk = 0.1
+
+                ext_exp = 0.0
+                w_sum = (float(weights.get("data_sensitivity", 0.30)) * data_sens) + \
+                        (float(weights.get("action_sensitivity", 0.25)) * action_sens) + \
+                        (float(weights.get("external_exposure", 0.20)) * ext_exp) + \
+                        (float(weights.get("chain_risk", 0.25)) * chain_risk)
+                fs_score = round((w_sum / scale_max) * 100.0, 2)
+                classification = "LOW"
+                action_name = "inspect_metadata" if is_dir_listing else "read_filesystem"
+                nodes = ["Agent", f"Tool:{tool_name}", "Resource:filesystem_data", f"Action:{tool_name}:{action_name}"]
+                path_id = generate_path_id(nodes)
+                selection_reason = (
+                    f"Authorized read-only filesystem operation within permitted directories. "
+                    f"Evaluated with data sensitivity {data_sens:.1f} and action sensitivity {action_sens:.1f} "
+                    f"(score={fs_score:.1f}, {classification}). "
+                    f"{len(potential_cross_tool_paths)} potential uninvoked cross-tool paths preserved for graph topology."
+                )
+                return PathScoringResult(
+                    path_nodes=nodes,
+                    path_edges=["CAN_CALL", "READS", "FLOWS_TO"],
+                    data_sensitivity=data_sens,
+                    action_sensitivity=action_sens,
+                    external_exposure=ext_exp,
+                    chain_risk=chain_risk,
+                    path_risk_score=fs_score,
+                    classification=classification,
+                    is_critical_override=False,
+                    explanation=f"Authorized read within permitted directory (Score: {fs_score:.1f}, {classification})",
+                    policy_version=self.policy_version,
+                    metadata={
+                        "runtime_path_id": path_id,
+                        "matched_path": True,
+                        "match_status": "MATCHED",
+                        "tool_name": tool_name,
+                        "risk_score": fs_score,
+                        "classification": classification,
+                        "selection_reason": selection_reason,
+                        "observed_chain": False,
+                        "path_type": "RUNTIME_OBSERVED_DIRECT_READ",
+                        "potential_attack_paths": [p.to_dict() for p in potential_cross_tool_paths],
+                        "potential_paths_count": len(potential_cross_tool_paths)
+                    },
+                    path_id=path_id
+                )
+
+        # Evaluate against direct paths
+        if direct_paths:
+            sorted_direct = sorted(direct_paths, key=lambda p: p.path_risk_score, reverse=True)
+            selected = sorted_direct[0]
+            selection_reason = (
+                f"Direct capability path '{selected.path_id}' matched for tool '{tool_name}' "
+                f"(score={selected.path_risk_score:.1f}, {selected.classification}). "
+                f"{len(potential_cross_tool_paths)} potential uninvoked cross-tool paths preserved for graph topology."
+            )
             meta = dict(selected.metadata)
             meta.update({
                 "runtime_path_id": selected.path_id,
@@ -713,11 +1070,38 @@ class CapabilityGraph:
                 "risk_score": selected.path_risk_score,
                 "classification": selected.classification,
                 "selection_reason": selection_reason,
-                "candidate_paths_count": len(sorted_paths),
-                "candidate_path_ids": [p.path_id for p in sorted_paths if p.path_id],
-                "path_type": "RUNTIME_MATCHED_SINGLE"
+                "candidate_paths_count": len(sorted_direct),
+                "candidate_path_ids": [p.path_id for p in sorted_direct if p.path_id],
+                "path_type": "RUNTIME_MATCHED_DIRECT",
+                "observed_chain": False,
+                "potential_attack_paths": [p.to_dict() for p in potential_cross_tool_paths],
+                "potential_paths_count": len(potential_cross_tool_paths)
             })
             return dc_replace(selected, metadata=meta)
+
+        # Fallback if only cross-tool paths were enumerated but no direct action sink was modeled
+        if paths:
+            matched = matched_cap or self.tool_capabilities.get(tool_name)
+            if matched:
+                nodes = ["Agent", f"Tool:{tool_name}", f"Resource:{matched.data_target}", f"Action:{tool_name}:{matched.action_type}"]
+                if matched.external_destination:
+                    nodes.append(f"Destination:{matched.external_destination}")
+                direct_score = self.score_path(nodes)
+                meta = dict(direct_score.metadata)
+                meta.update({
+                    "runtime_path_id": direct_score.path_id,
+                    "matched_path": True,
+                    "match_status": "MATCHED",
+                    "tool_name": tool_name,
+                    "risk_score": direct_score.path_risk_score,
+                    "classification": direct_score.classification,
+                    "selection_reason": f"Evaluated direct action for tool '{tool_name}' (score={direct_score.path_risk_score:.1f}).",
+                    "observed_chain": False,
+                    "path_type": "RUNTIME_MATCHED_DIRECT_SYNTHESIZED",
+                    "potential_attack_paths": [p.to_dict() for p in paths],
+                    "potential_paths_count": len(paths)
+                })
+                return dc_replace(direct_score, metadata=meta)
 
         # 4. Unknown / unmodeled path fallback (configurable in policy, never treated as safe)
         unknown_cfg = self.policy.get("unknown_path_handling", {

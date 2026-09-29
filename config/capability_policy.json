@@ -48,6 +48,23 @@
     ],
     "require_consumed_data_match": true
   },
+  "data_access_policy": {
+    "enabled": true,
+    "authorized_tables": ["customers", "users", "products", "orders", "database_records", "mcpath_eval_scratch"],
+    "restricted_patterns": [
+      "(?i)(password|secret|credential|auth_token|credit_card|private_key|api_key|ssn)"
+    ],
+    "authorized_read_data_sensitivity": 1.0,
+    "restricted_data_sensitivity": 3.0,
+    "authorized_email_recipients": ["internal.company.com", "trusted.org", "security-team@internal"],
+    "authorized_directories": ["C:/projects/mcp-demos/filesystem", "c:/projects/mcp-demos/filesystem", "/projects/mcp-demos/filesystem"],
+    "restricted_file_patterns": [
+      "(?i)(\\.env|id_rsa|id_ed25519|passwd|shadow|credentials|secret|token|\\.ssh|\\.gnupg|password)"
+    ],
+    "authorized_read_file_sensitivity": 1.0,
+    "authorized_dir_list_sensitivity": 0.5,
+    "unauthorized_path_sensitivity": 3.0
+  },
   "explicit_tool_rules": {
     "list_allowed_directories": {
       "data_target": "allowed_directories_list",

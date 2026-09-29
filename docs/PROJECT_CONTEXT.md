@@ -192,8 +192,8 @@ The pipeline evaluates every intercepted call in two deterministic phases:
 | Stage | Name | Role & Question Answered | Status |
 |---|---|---|---|
 | **Stage 1** | **Tool Integrity Hash Check** | *"Has this tool's definition changed since it was approved?"* Computes SHA-256 over canonicalized JSON and compares against PostgreSQL `approved_hashes`. Mismatches trigger immediate hard block without evaluating later stages (stops tool rug pulls). Fail-closed on missing baseline/DB error. | **IMPLEMENTED** |
-| **Stage 2** | **Capability Risk** | *"Can this tool access sensitive resources or chain to external exfiltration?"* Analyzes graph paths in NetworkX (Agent $\rightarrow$ Tool $\rightarrow$ Resource $\rightarrow$ Action $\rightarrow$ Destination) to produce risk score $[0, 100]$. Deterministic policy file (`config/capability_policy.json`), transition-based chain risk, critical override for sensitive $\rightarrow$ external paths, fail-safe unknown path elevated scoring. | **IMPLEMENTED** |
-| **Stage 3** | **Intent Verification** | *"Does the requested tool call align with the user's explicit prompt?"* Compares embeddings of user prompt vs tool call semantics to detect prompt injection/jailbreak manipulation. | **SKELETON / READY FOR EXPANSION** |
+| **Stage 2** | **Capability Risk (Runtime-Aware)** | *"Can this tool access sensitive resources or chain to external exfiltration?"* Analyzes graph paths in NetworkX (`Agent -> Tool -> Resource -> Action -> Destination`). Evaluates actual runtime context and call history; separates direct paths of the active tool from theoretical cross-tool paths. Benign reads within data access policy are allowed; observed exfiltration chains trigger critical path override to HIGH (90.0). | **IMPLEMENTED** |
+| **Stage 3** | **Intent Verification** | *"Does the requested tool call align with the user's explicit prompt?"* Compares embeddings of user prompt vs tool call semantics using `all-MiniLM-L6-v2` cosine similarity. Explicitly skips missing prompts (`SKIPPED_NO_PROMPT`) without scoring penalty. | **IMPLEMENTED** |
 | **Stage 4** | **Behaviour Deviation** | *"Is this call anomalous compared to historical baseline traces?"* Checks parameter sizes, invocation frequencies, and argument shapes against historical statistical baselines. | **SKELETON / READY FOR EXPANSION** |
 | **Stage 5** | **Response Risk Inspection** | *"Does the downstream server output leak sensitive data (PII, API keys, credentials)?"* Inspects tool outputs using fast regex heuristics and optional secondary bounded classifier. | **SKELETON / READY FOR EXPANSION** |
 | **Risk Engine** | **Deterministic Risk Engine** | *"What is the final enforcement decision?"* Evaluates hard-block gates first, then thresholds combined scores into `ALLOW`, `HOLD`, or `BLOCK`. Attaches complete explainability evidence. Evaluated in two phases: pre-call and post-call. | **IMPLEMENTED** |
@@ -202,7 +202,7 @@ The pipeline evaluates every intercepted call in two deterministic phases:
 
 ## 6. How to Run and Verify
 
-1. **Run full automated test suite (28 tests)**:
+1. **Run full automated test suite (136 tests)**:
    ```powershell
    .venv\Scripts\python.exe -m pytest -v
    ```
@@ -308,4 +308,42 @@ The pipeline evaluates every intercepted call in two deterministic phases:
     - Added focused tests in `tests/test_evaluation_system.py` (5 passed in 0.42s).
     - Executed `run_evaluation.py` CLI across all 46 scenarios generating complete report artifacts in `evaluation/`.
     - Executed full test suite: **114 passed** across the entire repository (100% pass).
+- **2026-09-28 (Filesystem Read-Risk Evaluation & HOLD Admin Approval Workflow)**:
+  - **Root Cause Resolution for Excessive Read Scores (36.7 and 40.8)**:
+    - Root cause: `config/capability_policy.json` assigned static sensitivity 2.0 to `Resource:filesystem_data`, and `calculate_chain_risk` treated any read as `sensitive_data_to_read_action` (1.0), yielding base score `(0.30*2.0 + 0.25*1.0 + 0.25*1.0)/3.0 * 100 = 36.67` (and 40.8 with cross-tool transitions).
+    - Added runtime-aware filesystem evaluation in `mcpath/graph/capability_graph.py` and `config/capability_policy.json`:
+      - Directory listings / tree / metadata (`list_directory`, `directory_tree`, etc.) $\rightarrow$ score 10.0 (`LOW` $\rightarrow$ `ALLOW`).
+      - Authorized ordinary file reads (`read_file`, `read_text_file`, `read_media_file`, `search_files`) $\rightarrow$ score 19.2 (`LOW` $\rightarrow$ `ALLOW`).
+      - Path traversal (`../`) and unauthorized system paths (`C:/Windows/System32`, `/etc`) $\rightarrow$ score 70.0 (`HIGH` $\rightarrow$ `BLOCK`).
+      - Restricted credential files (`.env`, `id_rsa`, `passwd`, `credentials`, `password`) $\rightarrow$ score 46.7 (`MEDIUM` $\rightarrow$ `HOLD`).
+      - Observed exfiltration chains (file read followed by `send_email` to unauthorized external recipient) $\rightarrow$ Critical Path Override 90.0 (`HIGH` $\rightarrow$ `BLOCK`).
+  - **Root Cause Resolution for Missing Dashboard HOLD Events**:
+    - In `mcpath/pipeline/pipeline_runner.py`, `run_pre_call` previously checked `if context.event_record.decision == EnforcementDecision.BLOCK:`. Because `HOLD` interrupted the pipeline before `run_post_call`, it was never written to `security_events`.
+    - Fixed to `if context.event_record.decision in (EnforcementDecision.BLOCK, EnforcementDecision.HOLD):`, immediately persisting all held security events to the database with a stable UUID `event_id`.
+  - **Administrator Approval Queue & Workflow Architecture**:
+    - **Persistence Model (`mcpath/backend/persistence/models.py`)**: Added `PendingApprovalDB` with foreign key to `SecurityEventDB`, tracking `status` (`PENDING`, `APPROVED`, `REJECTED`, `TIMED_OUT`), `tool_name`, `server_name`, `masked_arguments`, `risk_score`, `reason`, `created_at`, `resolved_at`, and `resolved_by`.
+    - **Approval Manager (`mcpath/proxy/approval_manager.py`)**: Thread-safe async queue using `asyncio.Event`s, status persistence, DB polling fallback, configurable timeout (default 30s), and strict replay prevention.
+    - **Proxy Server Integration (`mcpath/proxy/server.py`)**: Held calls pause and wait for admin approval up to `approval_timeout_seconds`. On approval, the call resumes and executes downstream exactly once; on rejection or timeout, downstream execution is blocked and an error response is returned. Supports non-blocking mode for automated batch evaluation.
+    - **IPC Control Channel (`mcpath/proxy/control.py`)**: Added `approve_call` and `reject_call` actions over local IPC.
+    - **REST API Endpoints (`mcpath/backend/routes/approvals.py`)**: Added `GET /api/approvals`, `GET /api/approvals/pending`, `GET /api/approvals/{id}`, `POST /api/approvals/{id}/approve`, `POST /api/approvals/{id}/reject`.
+    - **Streamlit SOC Dashboard UI**: Added `frontend/streamlit_app/pages/8_Admin_Approvals.py` featuring pending approval cards, masked arguments JSON viewer, Approve and Block buttons, and full audit history. Added pending review banner in `1_Security_Overview.py`.
+- **2026-09-29 (Real-Time HOLD Notifications, Admin Approval Workflow & Bug Fixes)**:
+  - **Root Cause Resolution for Missing Approvals on Dashboard**:
+    - *Database Fallback Bug*: During post-call event persistence, `run_post_call` called `persist_security_event` using an existing `event_id`. The unconditional `INSERT` failed on PostgreSQL unique constraint `ix_security_events_event_id`. `_run_with_retry` indiscriminately called `_switch_to_fallback()`, silently diverting the proxy process to local SQLite (`mcpath.db`) while FastAPI backend and Streamlit queried PostgreSQL.
+    - *Fix*: Made `persist_security_event` an idempotent upsert (`SELECT` then `UPDATE` or `INSERT`). Restricted `_switch_to_fallback()` exclusively to connection/network failure exceptions.
+    - *Post-Call Re-HOLD Trap*: After an administrator approved a held call, `run_post_call` re-evaluated the capability risk (which remained >= 30.0 for credential files), causing the Risk Engine to re-evaluate the decision as `HOLD` and blocking the tool result from returning to Claude Desktop.
+    - *Fix*: Added `pre_call_approved: bool = False` flag to `PipelineContext`. When approved, this flag is set to `True`, skipping pre-call hold re-evaluation in `run_post_call`.
+    - *Database Pool Loop Cross-Talk*: Pytest async suites threw `RuntimeError: Event loop is closed` on asyncpg pools. Resolved by setting `NullPool` on asyncpg engine instances.
+    - *Missing Server in Server Config*: Added `postgres-mcp` back to `active_servers` in `config/server_config.json`, restoring all 5 servers and all 41 tools.
+  - **Streamlit Real-Time Dashboard Integration**:
+    - **Global Polling Banner (`frontend/streamlit_app/components/approval_notifications.py`)**: Implemented `@st.fragment(run_every="2s")` polling `/api/approvals?status=PENDING`. Prominently renders across *all* dashboard pages automatically without manual browser refresh, showing server, tool, masked arguments, risk score, reason, live countdown timer, and inline Approve/Reject action buttons.
+    - **Sidebar Notification Badge (`frontend/streamlit_app/app.py`)**: Displays real-time pending approvals count badge in sidebar navigation (`Admin Approvals (N)`).
+    - **Admin Approvals Page (`frontend/streamlit_app/pages/8_Admin_Approvals.py`)**: Visual 30-second countdown timer progress bar, masked argument inspector, Approve/Reject buttons, status filters, and persistent audit logs.
+    - **Auto-Expiration**: Backend automatically transitions pending approvals older than 30s to `TIMED_OUT` with `resolved_by="system:timeout"`.
+  - **Empirical Evaluation & Tests**:
+    - Enhanced `tests/test_filesystem_and_approvals.py` to 15 tests covering immediate API visibility, auto-timeout, and multiple concurrent independent resolutions.
+    - Full pytest suite: **141/141 passed** in 44s (100% pass rate).
+    - Evaluation benchmark: **48/48 passed** (100% pass rate, 0 FP, 0 FN).
+    - Claude Desktop live scenario script (`verify_claude_demo_scenarios.py`): All 6 scenarios passed (ordinary read/list allowed, `.env` held, approved executes once, rejected blocked, timed out blocked).
+
 

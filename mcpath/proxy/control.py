@@ -105,6 +105,20 @@ async def dispatch_control_action(
         return await mgr.get_all_servers_status()
     elif action == "reload":
         return await mgr.reload()
+    elif action == "approve_call":
+        from mcpath.proxy.approval_manager import approval_manager
+        return await approval_manager.resolve_approval(
+            approval_id=params["approval_id"],
+            action="APPROVED",
+            resolver=params.get("resolver", "admin")
+        )
+    elif action == "reject_call":
+        from mcpath.proxy.approval_manager import approval_manager
+        return await approval_manager.resolve_approval(
+            approval_id=params["approval_id"],
+            action="REJECTED",
+            resolver=params.get("resolver", "admin")
+        )
     else:
         raise ValueError(f"Unknown proxy control action: '{action}'")
 

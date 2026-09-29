@@ -219,6 +219,7 @@ class SecurityEventDB(Base):
     stage_results = relationship("StageResultDB", back_populates="security_event", cascade="all, delete-orphan")
     decision_record = relationship("DecisionDB", back_populates="security_event", uselist=False, cascade="all, delete-orphan")
     intent_evaluation = relationship("IntentEvaluationDB", back_populates="security_event", uselist=False, cascade="all, delete-orphan")
+    pending_approval = relationship("PendingApprovalDB", back_populates="security_event", uselist=False, cascade="all, delete-orphan")
 
 
 class StageResultDB(Base):
@@ -274,3 +275,27 @@ class IntentEvaluationDB(Base):
 
     # Relationships
     security_event = relationship("SecurityEventDB", back_populates="intent_evaluation")
+
+
+class PendingApprovalDB(Base):
+    """Pending and resolved administrative approvals for held tool invocations."""
+    __tablename__ = "pending_approvals"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    approval_id = Column(String(64), unique=True, nullable=False, index=True)
+    event_id = Column(String(64), ForeignKey("security_events.event_id", ondelete="CASCADE"), nullable=False, index=True)
+    server_name = Column(String(100), nullable=False, index=True)
+    tool_name = Column(String(100), nullable=False, index=True)
+    arguments_json = Column(JSON, nullable=True)
+    masked_arguments_json = Column(JSON, nullable=True)
+    risk_score = Column(Float, nullable=False)
+    reason = Column(Text, nullable=False)
+    status = Column(String(30), default="PENDING", nullable=False, index=True)  # PENDING, APPROVED, REJECTED, TIMED_OUT
+    resolved_by = Column(String(100), nullable=True)
+    resolved_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc), nullable=False)
+
+    # Relationships
+    security_event = relationship("SecurityEventDB", back_populates="pending_approval")
+

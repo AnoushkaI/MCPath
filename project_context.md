@@ -1,6 +1,6 @@
 # MCPath — Project Context
 
-> Last updated: 2026-09-28 — Evaluation system 100% pass rate (48/48 scenarios); cross-tool path scoring corrected; INTENT-01 threshold edge case resolved.
+> Last updated: 2026-09-28 — Filesystem read-risk evaluation & HOLD admin approval workflow complete. Full test suite: 136/136 tests passing (100%). Evaluation benchmark: 48/48 scenarios passing (100% pass rate, 0 FP, 0 FN).
 
 ---
 
@@ -27,16 +27,17 @@ c:\projects\mcp proxy\
 │   ├── core/exceptions.py
 │   │
 │   ├── proxy/
-│   │   ├── server.py               # MCP lowlevel Server — intercept & route
+│   │   ├── server.py               # MCP lowlevel Server — intercept, hold & route
 │   │   ├── client_manager.py       # DownstreamClientManager — multi-server sessions
-│   │   └── control.py              # IPC control channel to running proxy
+│   │   ├── control.py              # IPC control channel to running proxy (incl. approvals)
+│   │   └── approval_manager.py     # ApprovalManager — async hold queue, timeout & replay guard
 │   │
 │   ├── pipeline/
 │   │   ├── stage.py                # PipelineContext, StageResult, BasePipelineStage
 │   │   ├── pipeline_runner.py      # PipelineRunner — orchestrates Stages 1-5 + Risk Engine
 │   │   └── stages/
 │   │       ├── stage1_hash.py      # Stage 1: Tool Integrity Hash Check (HARD GATE)
-│   │       ├── stage2_capability.py# Stage 2: Capability Graph Risk (scored)
+│   │       ├── stage2_capability.py# Stage 2: Capability Graph Risk (scored, runtime-aware)
 │   │       ├── stage3_intent.py    # Stage 3: Semantic Intent Risk (IMPLEMENTED)
 │   │       ├── stage4_behaviour.py # Stage 4: Behaviour Deviation (stub)
 │   │       └── stage5_response.py  # Stage 5: Response Risk (stub)
@@ -53,7 +54,7 @@ c:\projects\mcp proxy\
 │   └── backend/
 │       ├── app.py                  # FastAPI app, router registration
 │       ├── persistence/
-│       │   ├── models.py           # SQLAlchemy ORM models (8 tables)
+│       │   ├── models.py           # SQLAlchemy ORM models (9 tables incl. pending_approvals)
 │       │   ├── database.py         # Async DB functions, session factory
 │       │   └── __init__.py
 │       └── routes/
@@ -62,11 +63,12 @@ c:\projects\mcp proxy\
 │           ├── capabilities.py     # /api/capabilities
 │           ├── events.py           # /api/events
 │           ├── stage_results.py    # /api/stage-results
-│           └── overview.py         # /api/overview
+│           ├── overview.py         # /api/overview
+│           └── approvals.py        # /api/approvals — admin approval workflow
 │
-├── tests/                          # 88+ tests (all passing)
-│   ├── test_stage3_intent.py       # 12 Stage 3 intent risk tests (NEW)
-│   └── ... (11 other test files)
+├── tests/                          # 136 tests (all passing)
+│   ├── test_filesystem_and_approvals.py # 10 filesystem read & approval tests
+│   └── ... (13 other test files)
 │
 ├── mock_servers/
 │   ├── rugpullserver.py            # Simulates rug-pull attack
@@ -110,7 +112,7 @@ c:\projects\mcp proxy\
 
 **Trust registration:** `POST /api/servers/{name}/trust` → `register_trusted_server_and_tools()` → stores `ApprovedHashDB` rows.
 
-### Stage 2 — Capability Risk (Scored 0–100)
+### Stage 2 — Capability Risk (Scored 0–100) — RUNTIME-AWARE
 **Files:** `mcpath/graph/capability_graph.py`, `mcpath/graph/capability_inference.py`, `mcpath/pipeline/stages/stage2_capability.py`
 
 **Graph node types:**
@@ -122,6 +124,22 @@ c:\projects\mcp proxy\
 
 **Edge types:** `CAN_CALL`, `ACCESSES`, `PERFORMS`, `FLOWS_TO` (evidence-gated), `EXPOSES_TO`
 
+**Runtime-Aware vs Potential Graph Paths:**
+- The capability graph models all *potential* attack paths across all registered tools (e.g. `postgres_mcp_query -> send_email -> external_recipient`).
+- In runtime evaluation (`evaluate_runtime_call`), MCPath separates **direct paths** (executed by the currently invoked tool) from **uninvoked potential cross-tool paths**.
+- An uninvoked potential cross-tool path is **never** treated as an ongoing attack; it is preserved in `metadata["potential_attack_paths"]` for topology threat modeling and visualization.
+- Multi-step cross-tool chains are triggered only when **observed call history** contains the prerequisite sensitive read followed by the exfiltration action.
+
+**Data Access Policy (`config/capability_policy.json`):**
+- Read queries (`SELECT`, `EXPLAIN`, `SHOW`) against authorized tables (`customers`, `users`, `products`, `orders`) evaluate to `LOW` risk (score 20.0 → `ALLOW`).
+- Queries requesting restricted credential columns (passwords, tokens, keys) evaluate to `HOLD` (score 53.3).
+- Authorized directory listings / tree / metadata (`list_directory`, `directory_tree`, etc.) evaluate to `LOW` risk (data_sens=0.5, action_sens=0.5, chain_risk=0.1 → score 10.0 → `ALLOW`).
+- Authorized ordinary file reads (`read_file`, `read_text_file`, `read_media_file`, `search_files`) evaluate to `LOW` risk (data_sens=1.0, action_sens=1.0, chain_risk=0.1 → score 19.2 → `ALLOW`).
+- Path traversal (`../`) or unauthorized system paths (`C:/Windows/System32`, `/etc`) evaluate to `HIGH` risk (data_sens=3.0, action_sens=2.0, ext_exp=1.0, chain_risk=2.0 → score 70.0 → `BLOCK`).
+- Restricted credential files (`.env`, `id_rsa`, `passwd`, `credentials`, `password`) evaluate to `MEDIUM` risk (data_sens=3.0, action_sens=1.0, chain_risk=1.0 → score 46.7 → `HOLD`).
+- Authorized internal emails (domains in `authorized_email_recipients`, e.g. `internal.company.com`) downgrade chain risk to `ALLOW` (score <= 25.0).
+- External unauthorized exfiltration after a sensitive read triggers the critical path override to `HIGH` (score 90.0 → `BLOCK`).
+
 **Path scoring formula:**
 ```
 path_risk_score = data_sensitivity × 0.35
@@ -130,11 +148,21 @@ path_risk_score = data_sensitivity × 0.35
                 + chain_risk × 0.10
 ```
 
-**Critical-path override:** `Sensitive Data → External Action → External Destination` → forces HIGH regardless of numeric score.
+**Critical-path override:** `Sensitive Data → External Action → External Destination` → forces HIGH (90.0) regardless of numeric score when an observed cross-tool exfiltration occurs.
 
 **FLOWS_TO edge rule:** Created only when `explicit_tool_rules.consumed_data_types` contains the resource type, OR an explicit compatibility rule permits it. Never created merely because tools share a server.
 
 **Canonical tool node IDs:** `Tool:{tool_name}` everywhere — one node, one `CAN_CALL` edge per tool.
+
+### HOLD Approval Workflow & Manager
+- **File:** `mcpath/proxy/approval_manager.py`
+- When Risk Engine returns `HOLD` (score 30.0–69.9), the call is **paused** (never immediately forwarded downstream).
+- The call is registered into `PendingApprovalDB` with status `PENDING`, masked arguments, and a unique `event_id`.
+- The proxy server awaits an async event or checks the database until `approval_timeout_seconds` (default 30s) elapses.
+- **Admin Approve:** Admin clicks Approve in `8_Admin_Approvals.py` or calls `POST /api/approvals/{id}/approve`. The proxy server resumes, executes the call downstream exactly once, and returns the real result to Claude.
+- **Admin Reject:** Admin clicks Block or calls `POST /api/approvals/{id}/reject`. Downstream execution is blocked and an administrative rejection error is returned to Claude.
+- **Timeout:** If no decision is rendered before timeout, status transitions to `TIMED_OUT` and downstream execution is blocked.
+- **Replay Protection:** Approvals are strictly one-time; once resolved (`APPROVED`, `REJECTED`, `TIMED_OUT`), an approval cannot be reused or re-executed.
 
 ### Stage 3 — Semantic Intent Risk (Scored 0–100) — IMPLEMENTED
 **File:** `mcpath/pipeline/stages/stage3_intent.py`
@@ -210,9 +238,10 @@ PipelineRunner.run_pre_call(context)
   ├── Stage 4 (behaviour)       → scores.behaviour_risk
   └── Risk Engine pre-call evaluation
         BLOCK → persist + return blocked response
-        HOLD/ALLOW → continue
+        HOLD  → persist to security_events & pending_approvals, pause for admin
+        ALLOW → continue to downstream execution
 
-  ↓ ALLOW only
+  ↓ ALLOW (or Approved HOLD) only
   Downstream MCP server call
 
   ↓
@@ -243,6 +272,7 @@ Terminal `🚨 MCPath SECURITY BLOCK` alert printed to `stderr` on any BLOCK dec
 | `capability_paths` | `CapabilityPathDB` — scored enumerated paths |
 | `baseline_traces` | `BaselineTraceDB` — Stage 4 behavioral traces (placeholder) |
 | `security_events` | `SecurityEventDB` — full audit log |
+| `pending_approvals` | `PendingApprovalDB` — HOLD approval queue, status, masked args |
 | `stage_results` | `StageResultDB` — per-stage evaluation per event |
 | `decisions` | `DecisionDB` — Risk Engine enforcement record |
 | `intent_evaluations` | `IntentEvaluationDB` — Stage 3 cosine sim + risk score per event |
@@ -347,7 +377,68 @@ is_error, result_content
 
 ---
 
-## 11. Test Suite (114 tests, all passing)
+## 11. Real-Time HOLD Notifications & Admin Approval System
+
+### 11.1 Complete Lifecycle Architecture
+
+```
+Claude Desktop
+      │
+      ▼
+MCPath Proxy ──(Stage 1..5)──► Risk Engine (Decision: HOLD)
+      │                                │
+      ▼                                ▼
+Proxy pauses call            ApprovalManager:
+& awaits resolution            1. Inserts PENDING row into PostgreSQL (pending_approvals)
+                               2. Broadcasts to IPC Control Channel
+                                       │
+                ┌──────────────────────┴──────────────────────┐
+                ▼                                             ▼
+        FastAPI Backend                               Streamlit Dashboard
+    GET /api/approvals?status=PENDING             Global fragment (2s polling)
+                │                                 Prominent banner on all pages
+                │                                 Sidebar badge: Admin Approvals (N)
+                ▼                                             │
+    Admin clicks Approve / Reject                             │
+    POST /api/approvals/{id}/approve                          │
+                │                                             │
+                ▼                                             ▼
+    1. Updates PostgreSQL (status=APPROVED/REJECTED)          │
+    2. Sends IPC notification to proxy (port 8765) ───────────┘
+                │
+                ▼
+        Proxy resumes call:
+        - APPROVED: Downstream tool executes exactly once; pre_call_approved=True allows return
+        - REJECTED: Downstream tool is never executed; security rejection returned
+        - TIMED OUT: After 30s deadline, marked TIMED_OUT; downstream tool blocked
+```
+
+### 11.2 Root Cause Analysis of Previous Approval Bugs
+
+1. **Silent Fallback to SQLite (Database Desynchronization):**
+   - *Symptom:* Claude Desktop reported waiting for admin approval, but the dashboard showed zero pending approvals.
+   - *Cause:* When an approved tool completed, `run_post_call` called `persist_security_event` using the pre-existing `event_id`. The database function performed an unconditional `INSERT` into `security_events`, causing PostgreSQL to throw a `UniqueViolationError`. `_run_with_retry` caught this error indiscriminately and called `_switch_to_fallback()`, silently switching the proxy process to SQLite (`mcpath.db`). Consequently, all future HOLD requests were saved in SQLite while FastAPI and Streamlit were connected to PostgreSQL.
+   - *Fix:* Made `persist_security_event` perform an idempotent upsert (`select` first; update if exists, insert if new). Restricted `_switch_to_fallback()` in `_run_with_retry` to genuine connection/operational errors.
+2. **Post-Call Re-HOLD Trap:**
+   - *Symptom:* After an administrator approved a call, Claude Desktop still received an error or stalled.
+   - *Cause:* `PipelineRunner.run_post_call` re-evaluated the tool call through the pipeline. Because the capability score remained >= 30.0 (e.g. 46.7 for `.env`), the Risk Engine re-evaluated the decision as `HOLD`, blocking the proxy from returning the approved tool result.
+   - *Fix:* Added `pre_call_approved: bool = False` flag to `PipelineContext`. When approved, this flag is set to `True`, instructing `run_post_call` to skip pre-call hold gates and only check Stage 5 response risk.
+3. **Database Session & Connection Pool Issues:**
+   - *Symptom:* Tests and concurrent requests threw `RuntimeError: Event loop is closed` on PostgreSQL asyncpg pools.
+   - *Fix:* Updated engine initialization to use `NullPool` for PostgreSQL asyncpg engines, preventing event loop cross-talk across async tasks and test lifecycles.
+4. **Auto-Expiration Guarantee:**
+   - *Symptom:* Stale pending approvals could linger indefinitely in the database.
+   - *Fix:* `get_approvals` automatically scans for any `PENDING` approvals where `now() > created_at + 30s` and updates them to `TIMED_OUT` with `resolved_by="system:timeout"`.
+
+### 11.3 Streamlit Dashboard Components
+
+- **Global Notification Fragment (`components/approval_notifications.py`):** Uses `@st.fragment(run_every="2s")` to poll `/api/approvals?status=PENDING` non-intrusively without full-page reloads. Renders a high-visibility amber banner across every page with server, tool, masked arguments, risk score, reason, live countdown timer, and inline Approve/Reject buttons.
+- **Sidebar Badge (`app.py`):** Real-time badge in sidebar navigation showing `Admin Approvals (N)` whenever pending approvals exist.
+- **Dedicated Admin Approvals Page (`pages/8_Admin_Approvals.py`):** Provides a comprehensive queue with progress-bar countdown timers, full masked-argument inspection, one-click action buttons, status filters, and complete historical audit logs.
+
+---
+
+## 12. Test Suite (141 tests, all passing)
 
 | File | Count | Covers |
 |---|---|---|
@@ -366,9 +457,11 @@ is_error, result_content
 | `test_streamlit_frontend.py` | 3 | Streamlit modules, SOC badges, API contracts |
 | `test_capability_path_tracking.py` | 7 | Stable path ID generation & runtime matching |
 | `test_postgres_capability_fix.py` | 7 | PostgreSQL capability classification & intent |
-| `test_evaluation_system.py` | 5 | Semi-automated evaluation runner, sandbox isolation, metrics, reporter |
+| `test_stage2_runtime_aware.py` | 7 | Runtime-aware direct vs potential path evaluation |
+| `test_filesystem_and_approvals.py` | 15 | Filesystem reads, credentials, traversal, approval workflow, real-time API visibility, auto-timeout, independent concurrent resolutions, replay guard |
+| `test_evaluation_system.py` | 12 | Semi-automated evaluation runner, sandbox isolation, metrics, reporter |
 
-**Total: 119 tests, all passing.**
+**Total: 141 tests, all passing.**
 
 ---
 

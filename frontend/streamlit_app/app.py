@@ -75,6 +75,24 @@ with st.sidebar:
         </div>
         """, unsafe_allow_html=True)
 
+    # Active Pending Approvals Badge in Sidebar
+    pending_approvals = client.get_pending_approvals(limit=50)
+    pending_count = len(pending_approvals)
+    if pending_count > 0:
+        st.markdown(f"""
+        <div style="background-color: rgba(245, 158, 11, 0.18); border: 2px solid #f59e0b; border-radius: 8px; padding: 10px 14px; margin-bottom: 16px;">
+            <div style="display: flex; align-items: center; justify-content: space-between;">
+                <span style="font-weight: 800; color: #fbbf24; font-size: 0.88rem;">🚨 PENDING APPROVALS</span>
+                <span style="background: #f59e0b; color: #0b0f19; font-weight: 900; font-size: 0.8rem; padding: 2px 7px; border-radius: 10px;">
+                    {pending_count}
+                </span>
+            </div>
+            <div style="font-size: 0.74rem; color: #e2e8f0; margin-top: 4px;">
+                Tool call(s) held for administrator review.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
     st.markdown("""
     <div style="padding: 10px 0; font-size: 0.78rem; color: #cbd5e1; border-top: 1px solid #1e293b; margin-top: 20px;">
         <div style="font-weight: 700; color: #f8fafc; margin-bottom: 6px; letter-spacing: 0.05em;">ACTIVE MCP PIPELINE:</div>
@@ -94,6 +112,10 @@ with st.sidebar:
 # -------------------------------------------------------------------------
 current_dir = Path(__file__).resolve().parent
 
+approvals_title = f"Admin Approvals ({pending_count})" if pending_count > 0 else "Admin Approvals"
+approvals_icon = "🚨" if pending_count > 0 else "⏳"
+approvals_page = st.Page(str(current_dir / "pages" / "8_Admin_Approvals.py"), title=approvals_title, icon=approvals_icon)
+
 pages = [
     st.Page(str(current_dir / "pages" / "1_Security_Overview.py"), title="Security Overview", icon="🛡️", default=True),
     st.Page(str(current_dir / "pages" / "2_Live_Runtime_Monitor.py"), title="Live Runtime Monitor", icon="📡"),
@@ -101,8 +123,19 @@ pages = [
     st.Page(str(current_dir / "pages" / "5_MCP_Servers.py"), title="MCP Server Management", icon="🖥️"),
     st.Page(str(current_dir / "pages" / "6_Security_Events.py"), title="Security Events", icon="📜"),
     st.Page(str(current_dir / "pages" / "7_Tool_Baseline_Inspector.py"), title="Tool Integrity", icon="🔒"),
+    approvals_page,
     st.Page(str(current_dir / "pages" / "4_Risk_Analysis.py"), title="Risk Analysis", icon="⚖️"),
 ]
+
+# Quick sidebar navigation button if pending approvals exist
+if pending_count > 0:
+    with st.sidebar:
+        if st.button(f"👉 Review {pending_count} Held Call(s)", key="sidebar_jump_approvals", use_container_width=True, type="primary"):
+            st.switch_page(approvals_page)
+
+# Render Global HOLD Notification Banner regardless of active page
+from frontend.streamlit_app.components.approval_notifications import render_global_hold_notification
+render_global_hold_notification(approvals_page)
 
 pg = st.navigation(pages)
 pg.run()

@@ -17,6 +17,7 @@ from mcpath.backend.persistence.models import (
     CapabilityPathDB,
     DecisionDB,
     IntentEvaluationDB,
+    PendingApprovalDB,
     SecurityEventDB,
     ServerDB,
     StageResultDB,
@@ -49,11 +50,12 @@ def set_engine(custom_engine):
 
 def _create_engine_instance(db_url: str):
     """Create engine instance with appropriate timeout and pooling."""
+    from sqlalchemy.pool import NullPool
     kwargs: Dict[str, Any] = {"echo": False}
     if "sqlite" in db_url:
         kwargs["connect_args"] = {"timeout": 30.0}
     else:
-        kwargs["pool_pre_ping"] = True
+        kwargs["poolclass"] = NullPool
     return create_async_engine(db_url, **kwargs)
 
 
@@ -174,17 +176,52 @@ async def _run_with_retry(operation: Callable[[AsyncSession], Any], session: Opt
                 pass
             return res
     except Exception as primary_exc:
-        logger.warning("Primary database query failed (%s), attempting fallback...", primary_exc)
-        await _switch_to_fallback()
-        fallback_factory = get_session_factory()
-        async with fallback_factory() as s:
-            res = await operation(s)
-            try:
-                if s.in_transaction():
-                    await s.rollback()
-            except Exception:
-                pass
-            return res
+        # Only switch to SQLite fallback on actual connection/network failures
+        err_msg = str(primary_exc).lower()
+        is_conn_error = (
+            isinstance(primary_exc, (OSError, ConnectionError))
+            or any(term in err_msg for term in (
+                "cannot connect",
+                "connection refused",
+                "connection closed",
+                "connection reset",
+                "connection does not exist",
+                "could not connect",
+                "is the server running",
+                "target machine actively refused",
+                "timeout",
+                "timed out"
+            ))
+        )
+        if "event loop is closed" in err_msg or "attribute 'send'" in err_msg or "attached to a different loop" in err_msg:
+            global _engine, _async_session_factory
+            _engine = None
+            _async_session_factory = None
+            new_factory = get_session_factory()
+            async with new_factory() as s:
+                res = await operation(s)
+                try:
+                    if s.in_transaction():
+                        await s.rollback()
+                except Exception:
+                    pass
+                return res
+
+        if is_conn_error:
+            logger.warning("Primary database connection failed (%s), attempting fallback...", primary_exc)
+            await _switch_to_fallback()
+            fallback_factory = get_session_factory()
+            async with fallback_factory() as s:
+                res = await operation(s)
+                try:
+                    if s.in_transaction():
+                        await s.rollback()
+                except Exception:
+                    pass
+                return res
+        else:
+            logger.error("Database operation failed: %s", primary_exc)
+            raise
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
@@ -625,7 +662,7 @@ async def persist_security_event(
     stage_results: Optional[List[Dict[str, Any]]] = None,
     session: Optional[AsyncSession] = None
 ) -> SecurityEventDB:
-    """Persist security event, stage evaluation results, and decision record into database."""
+    """Persist security event, stage evaluation results, and decision record into database (idempotent / upsert)."""
     async def _op(s: AsyncSession):
         event_id = event_dict.get("event_id") or f"evt_{datetime.now(timezone.utc).timestamp()}"
         timestamp = event_dict.get("timestamp") or datetime.now(timezone.utc).isoformat()
@@ -649,92 +686,145 @@ async def persist_security_event(
             beh_risk = getattr(scores, "behaviour_risk", None)
             res_risk = getattr(scores, "response_risk", None)
 
-        sec_event = SecurityEventDB(
-            event_id=event_id,
-            timestamp=timestamp,
-            server_name=server_name,
-            tool_name=tool_name,
-            arguments_json=arguments,
-            user_prompt=event_dict.get("user_prompt"),
-            expected_hash=event_dict.get("expected_hash"),
-            observed_hash=event_dict.get("observed_hash"),
-            hash_matched=event_dict.get("hash_matched"),
-            runtime_path_id=event_dict.get("runtime_path_id"),
-            matched_path=event_dict.get("matched_path"),
-            match_status=event_dict.get("match_status"),
-            capability_risk=cap_risk,
-            intent_risk=int_risk,
-            behaviour_risk=beh_risk,
-            response_risk=res_risk,
-            decision=decision if isinstance(decision, str) else getattr(decision, "value", str(decision)),
-            reason=reason,
-            hard_gate_triggered=hard_gate,
-            action_taken=action_taken
-        )
-        s.add(sec_event)
-        await s.flush()
+        decision_str = decision if isinstance(decision, str) else getattr(decision, "value", str(decision))
 
-        # Add granular stage results if provided
+        # Check if SecurityEventDB already exists for this event_id
+        stmt_exist = select(SecurityEventDB).where(SecurityEventDB.event_id == event_id)
+        res_exist = await s.execute(stmt_exist)
+        sec_event = res_exist.scalar_one_or_none()
+
+        if sec_event is None:
+            sec_event = SecurityEventDB(
+                event_id=event_id,
+                timestamp=timestamp,
+                server_name=server_name,
+                tool_name=tool_name,
+                arguments_json=arguments,
+                user_prompt=event_dict.get("user_prompt"),
+                expected_hash=event_dict.get("expected_hash"),
+                observed_hash=event_dict.get("observed_hash"),
+                hash_matched=event_dict.get("hash_matched"),
+                runtime_path_id=event_dict.get("runtime_path_id"),
+                matched_path=event_dict.get("matched_path"),
+                match_status=event_dict.get("match_status"),
+                capability_risk=cap_risk,
+                intent_risk=int_risk,
+                behaviour_risk=beh_risk,
+                response_risk=res_risk,
+                decision=decision_str,
+                reason=reason,
+                hard_gate_triggered=hard_gate,
+                action_taken=action_taken
+            )
+            s.add(sec_event)
+            await s.flush()
+        else:
+            if cap_risk is not None:
+                sec_event.capability_risk = cap_risk
+            if int_risk is not None:
+                sec_event.intent_risk = int_risk
+            if beh_risk is not None:
+                sec_event.behaviour_risk = beh_risk
+            if res_risk is not None:
+                sec_event.response_risk = res_risk
+            sec_event.decision = decision_str
+            sec_event.reason = reason
+            if hard_gate is not None:
+                sec_event.hard_gate_triggered = hard_gate
+            sec_event.action_taken = action_taken
+            await s.flush()
+
+        # Add or update granular stage results if provided
         has_stage3 = False
         if stage_results:
+            stmt_sr = select(StageResultDB).where(StageResultDB.event_id == event_id)
+            existing_sr_map = {sr_obj.stage_number: sr_obj for sr_obj in (await s.execute(stmt_sr)).scalars().all()}
+
             for sr in stage_results:
-                stage_rec = StageResultDB(
-                    event_id=event_id,
-                    stage_number=sr.get("stage_number", 1),
-                    stage_name=sr.get("stage_name", "Stage"),
-                    passed=sr.get("passed", True),
-                    hard_block=sr.get("hard_block", False),
-                    score=sr.get("score"),
-                    explanation=sr.get("explanation"),
-                    metadata_json=sr.get("metadata", {})
-                )
-                s.add(stage_rec)
+                stage_num = sr.get("stage_number", 1)
+                if stage_num in existing_sr_map:
+                    sr_obj = existing_sr_map[stage_num]
+                    sr_obj.passed = sr.get("passed", True)
+                    sr_obj.hard_block = sr.get("hard_block", False)
+                    sr_obj.score = sr.get("score")
+                    sr_obj.explanation = sr.get("explanation")
+                    sr_obj.metadata_json = sr.get("metadata", {})
+                else:
+                    stage_rec = StageResultDB(
+                        event_id=event_id,
+                        stage_number=stage_num,
+                        stage_name=sr.get("stage_name", "Stage"),
+                        passed=sr.get("passed", True),
+                        hard_block=sr.get("hard_block", False),
+                        score=sr.get("score"),
+                        explanation=sr.get("explanation"),
+                        metadata_json=sr.get("metadata", {})
+                    )
+                    s.add(stage_rec)
 
                 # Persist dedicated IntentEvaluationDB if this is Stage 3 and was actually evaluated
                 if sr.get("stage_number") == 3 or sr.get("stage_name") == "Stage 3 - Intent Risk":
                     has_stage3 = True
                     meta = sr.get("metadata", {}) or {}
                     if meta.get("status") != "SKIPPED_NO_PROMPT" and meta.get("cosine_similarity") is not None:
-                        intent_eval = IntentEvaluationDB(
-                            event_id=event_id,
-                            user_request=meta.get("user_request", event_dict.get("user_prompt")),
-                            tool_action=meta.get("tool_action", f"{tool_name}"),
-                            cosine_similarity=float(meta.get("cosine_similarity", 0.0)),
-                            intent_risk_score=float(sr.get("score") if sr.get("score") is not None else meta.get("intent_risk_score", 0.0)),
-                            similarity_threshold=float(meta.get("similarity_threshold", 0.70)),
-                            policy_version=str(meta.get("policy_version", "1.0.0")),
-                            classification=str(meta.get("classification", "LOW")),
-                            explanation=sr.get("explanation"),
-                            created_at=datetime.now(timezone.utc)
-                        )
-                        s.add(intent_eval)
+                        stmt_ie = select(IntentEvaluationDB).where(IntentEvaluationDB.event_id == event_id)
+                        existing_ie = (await s.execute(stmt_ie)).scalar_one_or_none()
+                        if existing_ie is None:
+                            intent_eval = IntentEvaluationDB(
+                                event_id=event_id,
+                                user_request=meta.get("user_request", event_dict.get("user_prompt")),
+                                tool_action=meta.get("tool_action", f"{tool_name}"),
+                                cosine_similarity=float(meta.get("cosine_similarity", 0.0)),
+                                intent_risk_score=float(sr.get("score") if sr.get("score") is not None else meta.get("intent_risk_score", 0.0)),
+                                similarity_threshold=float(meta.get("similarity_threshold", 0.70)),
+                                policy_version=str(meta.get("policy_version", "1.0.0")),
+                                classification=str(meta.get("classification", "LOW")),
+                                explanation=sr.get("explanation"),
+                                created_at=datetime.now(timezone.utc)
+                            )
+                            s.add(intent_eval)
+                        else:
+                            existing_ie.cosine_similarity = float(meta.get("cosine_similarity", 0.0))
+                            existing_ie.intent_risk_score = float(sr.get("score") if sr.get("score") is not None else meta.get("intent_risk_score", 0.0))
+                            existing_ie.explanation = sr.get("explanation")
 
         # Fallback persistence for direct intent evaluation in event_dict if not already persisted from stage_results
         if not has_stage3 and event_dict.get("intent_evaluation"):
             ie_data = event_dict["intent_evaluation"]
-            intent_eval = IntentEvaluationDB(
-                event_id=event_id,
-                user_request=ie_data.get("user_request", event_dict.get("user_prompt")),
-                tool_action=ie_data.get("tool_action", f"{tool_name}"),
-                cosine_similarity=float(ie_data.get("cosine_similarity", 0.0)),
-                intent_risk_score=float(ie_data.get("intent_risk_score", int_risk or 0.0)),
-                similarity_threshold=float(ie_data.get("similarity_threshold", 0.70)),
-                policy_version=str(ie_data.get("policy_version", "1.0.0")),
-                classification=str(ie_data.get("classification", "LOW")),
-                explanation=ie_data.get("explanation"),
-                created_at=datetime.now(timezone.utc)
-            )
-            s.add(intent_eval)
+            stmt_ie = select(IntentEvaluationDB).where(IntentEvaluationDB.event_id == event_id)
+            existing_ie = (await s.execute(stmt_ie)).scalar_one_or_none()
+            if existing_ie is None:
+                intent_eval = IntentEvaluationDB(
+                    event_id=event_id,
+                    user_request=ie_data.get("user_request", event_dict.get("user_prompt")),
+                    tool_action=ie_data.get("tool_action", f"{tool_name}"),
+                    cosine_similarity=float(ie_data.get("cosine_similarity", 0.0)),
+                    intent_risk_score=float(ie_data.get("intent_risk_score", int_risk or 0.0)),
+                    similarity_threshold=float(ie_data.get("similarity_threshold", 0.70)),
+                    policy_version=str(ie_data.get("policy_version", "1.0.0")),
+                    classification=str(ie_data.get("classification", "LOW")),
+                    explanation=ie_data.get("explanation"),
+                    created_at=datetime.now(timezone.utc)
+                )
+                s.add(intent_eval)
 
-        # Add decision record
-        decision_rec = DecisionDB(
-            event_id=event_id,
-            decision=decision if isinstance(decision, str) else getattr(decision, "value", str(decision)),
-            reason=reason,
-            hard_gate_triggered=hard_gate,
-            action_taken=action_taken
-        )
-        s.add(decision_rec)
+        # Upsert decision record
+        stmt_dec = select(DecisionDB).where(DecisionDB.event_id == event_id)
+        decision_rec = (await s.execute(stmt_dec)).scalar_one_or_none()
+        if decision_rec is None:
+            decision_rec = DecisionDB(
+                event_id=event_id,
+                decision=decision_str,
+                reason=reason,
+                hard_gate_triggered=hard_gate,
+                action_taken=action_taken
+            )
+            s.add(decision_rec)
+        else:
+            decision_rec.decision = decision_str
+            decision_rec.reason = reason
+            decision_rec.hard_gate_triggered = hard_gate
+            decision_rec.action_taken = action_taken
 
         await s.commit()
         return sec_event
@@ -971,3 +1061,220 @@ async def get_persisted_capability_paths(
         ]
 
     return await _run_with_retry(_op, session=session)
+
+
+def mask_sensitive_arguments(args: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Mask sensitive argument values (passwords, tokens, keys) for safe display."""
+    if not isinstance(args, dict):
+        return {}
+    masked = {}
+    for k, v in args.items():
+        k_lower = str(k).lower()
+        if any(kw in k_lower for kw in ("password", "secret", "token", "key", "credential", "auth")):
+            masked[k] = "******"
+        elif isinstance(v, dict):
+            masked[k] = mask_sensitive_arguments(v)
+        else:
+            masked[k] = v
+    return masked
+
+
+async def create_pending_approval(
+    approval_id: str,
+    event_id: str,
+    server_name: str,
+    tool_name: str,
+    arguments: Optional[Dict[str, Any]],
+    risk_score: float,
+    reason: str,
+    session: Optional[AsyncSession] = None
+) -> Dict[str, Any]:
+    """Persist a new pending approval record safely and idempotently."""
+    async def _op(s: AsyncSession) -> Dict[str, Any]:
+        # Ensure SecurityEventDB exists for foreign key constraint
+        stmt_ev = select(SecurityEventDB).where(SecurityEventDB.event_id == event_id)
+        ev_exists = (await s.execute(stmt_ev)).scalar_one_or_none()
+        if not ev_exists:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            placeholder_ev = SecurityEventDB(
+                event_id=event_id,
+                timestamp=now_iso,
+                server_name=server_name,
+                tool_name=tool_name,
+                arguments_json=arguments,
+                decision="HOLD",
+                reason=reason,
+                action_taken="Tool call held for review"
+            )
+            s.add(placeholder_ev)
+            await s.flush()
+
+        masked = mask_sensitive_arguments(arguments)
+
+        # Check if approval_id already exists (idempotent)
+        stmt_appr = select(PendingApprovalDB).where(PendingApprovalDB.approval_id == approval_id)
+        existing_appr = (await s.execute(stmt_appr)).scalar_one_or_none()
+        if existing_appr:
+            return {
+                "approval_id": existing_appr.approval_id,
+                "event_id": existing_appr.event_id,
+                "server_name": existing_appr.server_name,
+                "tool_name": existing_appr.tool_name,
+                "arguments": existing_appr.masked_arguments_json,
+                "risk_score": existing_appr.risk_score,
+                "reason": existing_appr.reason,
+                "status": existing_appr.status,
+                "created_at": existing_appr.created_at.isoformat() if existing_appr.created_at else None
+            }
+
+        appr = PendingApprovalDB(
+            approval_id=approval_id,
+            event_id=event_id,
+            server_name=server_name,
+            tool_name=tool_name,
+            arguments_json=arguments,
+            masked_arguments_json=masked,
+            risk_score=risk_score,
+            reason=reason,
+            status="PENDING",
+            created_at=datetime.now(timezone.utc)
+        )
+        s.add(appr)
+        await s.commit()
+        return {
+            "approval_id": appr.approval_id,
+            "event_id": appr.event_id,
+            "server_name": appr.server_name,
+            "tool_name": appr.tool_name,
+            "arguments": appr.masked_arguments_json,
+            "risk_score": appr.risk_score,
+            "reason": appr.reason,
+            "status": appr.status,
+            "created_at": appr.created_at.isoformat()
+        }
+
+    return await _run_with_retry(_op, session=session)
+
+
+async def get_approvals(
+    status: Optional[str] = None,
+    limit: int = 50,
+    session: Optional[AsyncSession] = None
+) -> List[Dict[str, Any]]:
+    """Retrieve approvals from database, auto-expiring timed-out pending approvals."""
+    async def _op(s: AsyncSession) -> List[Dict[str, Any]]:
+        from mcpath.config.settings import settings
+        timeout_seconds = float(getattr(settings, "approval_timeout_seconds", 30.0))
+        now = datetime.now(timezone.utc)
+
+        # Auto-timeout pending approvals that have exceeded timeout_seconds
+        stmt_pending = select(PendingApprovalDB).where(PendingApprovalDB.status == "PENDING")
+        res_pending = await s.execute(stmt_pending)
+        pending_records = list(res_pending.scalars().all())
+        updated_any = False
+        for p in pending_records:
+            if p.created_at:
+                created_at = p.created_at
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
+                age = (now - created_at).total_seconds()
+                if age > timeout_seconds:
+                    p.status = "TIMED_OUT"
+                    p.resolved_by = "system:timeout"
+                    p.resolved_at = now
+                    p.updated_at = now
+                    updated_any = True
+        if updated_any:
+            await s.commit()
+
+        stmt = select(PendingApprovalDB).order_by(PendingApprovalDB.id.desc()).limit(limit)
+        if status:
+            stmt = stmt.where(PendingApprovalDB.status == status.upper())
+        res = await s.execute(stmt)
+        return [
+            {
+                "approval_id": a.approval_id,
+                "event_id": a.event_id,
+                "server_name": a.server_name,
+                "tool_name": a.tool_name,
+                "arguments": a.masked_arguments_json,
+                "raw_arguments": a.arguments_json,
+                "risk_score": a.risk_score,
+                "reason": a.reason,
+                "status": a.status,
+                "resolved_by": a.resolved_by,
+                "resolved_at": a.resolved_at.isoformat() if a.resolved_at else None,
+                "created_at": a.created_at.isoformat() if a.created_at else None
+            }
+            for a in res.scalars().all()
+        ]
+
+    return await _run_with_retry(_op, session=session)
+
+
+async def get_approval_by_id(
+    approval_id: str,
+    session: Optional[AsyncSession] = None
+) -> Optional[Dict[str, Any]]:
+    """Retrieve a single approval by ID."""
+    async def _op(s: AsyncSession) -> Optional[Dict[str, Any]]:
+        stmt = select(PendingApprovalDB).where(PendingApprovalDB.approval_id == approval_id)
+        res = await s.execute(stmt)
+        a = res.scalar_one_or_none()
+        if not a:
+            return None
+        return {
+            "approval_id": a.approval_id,
+            "event_id": a.event_id,
+            "server_name": a.server_name,
+            "tool_name": a.tool_name,
+            "arguments": a.masked_arguments_json,
+            "raw_arguments": a.arguments_json,
+            "risk_score": a.risk_score,
+            "reason": a.reason,
+            "status": a.status,
+            "resolved_by": a.resolved_by,
+            "resolved_at": a.resolved_at.isoformat() if a.resolved_at else None,
+            "created_at": a.created_at.isoformat() if a.created_at else None
+        }
+
+    return await _run_with_retry(_op, session=session)
+
+
+async def update_approval_status(
+    approval_id: str,
+    status: str,
+    resolved_by: str = "admin",
+    session: Optional[AsyncSession] = None
+) -> Optional[Dict[str, Any]]:
+    """Update approval status (APPROVED, REJECTED, TIMED_OUT). Idempotent / replay-safe."""
+    async def _op(s: AsyncSession) -> Optional[Dict[str, Any]]:
+        stmt = select(PendingApprovalDB).where(PendingApprovalDB.approval_id == approval_id)
+        res = await s.execute(stmt)
+        a = res.scalar_one_or_none()
+        if not a:
+            return None
+        if a.status != "PENDING":
+            logger.warning("Approval '%s' already resolved with status '%s'", approval_id, a.status)
+            return {
+                "approval_id": a.approval_id,
+                "status": a.status,
+                "already_resolved": True,
+                "resolved_by": a.resolved_by,
+                "resolved_at": a.resolved_at.isoformat() if a.resolved_at else None
+            }
+        a.status = status.upper()
+        a.resolved_by = resolved_by
+        a.resolved_at = datetime.now(timezone.utc)
+        a.updated_at = datetime.now(timezone.utc)
+        await s.commit()
+        return {
+            "approval_id": a.approval_id,
+            "status": a.status,
+            "already_resolved": False,
+            "resolved_by": a.resolved_by,
+            "resolved_at": a.resolved_at.isoformat()
+        }
+
+    return await _run_with_retry(_op, session=session)
+

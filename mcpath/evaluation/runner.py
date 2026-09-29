@@ -207,8 +207,10 @@ class EvaluationRunner:
             if hasattr(self.pipeline_runner, "_recorded_stage_results"):
                 self.pipeline_runner._recorded_stage_results = []
 
-            # Invoke tool through MCPath proxy client session
-            call_res = await client_session.call_tool(exposed_name, args)
+            # Invoke tool through MCPath proxy client session (non-blocking hold for batch benchmark)
+            eval_args = dict(args)
+            eval_args["_non_blocking_hold"] = True
+            call_res = await client_session.call_tool(exposed_name, eval_args)
 
             # Inspect stage results recorded by PipelineRunner
             recorded_stages = getattr(self.pipeline_runner, "_recorded_stage_results", [])
